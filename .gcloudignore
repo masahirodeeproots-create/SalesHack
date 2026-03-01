@@ -1,0 +1,12 @@
+venv/
+.venv/
+__pycache__/
+*.py[cod]
+.env
+.git/
+.DS_Store
+HRサービス使用状況調査/
+service-account-key.json
+data/checkpoints/
+data/logs/
+data/debug/

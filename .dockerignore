@@ -1,0 +1,11 @@
+venv/
+__pycache__/
+*.pyc
+.env
+.git/
+.gitignore
+service-account-key.json
+HRサービス使用状況調査/
+data/checkpoints/
+data/logs/
+data/debug/

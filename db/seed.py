@@ -20,7 +20,7 @@ PROJECT_ROOT = Path(__file__).resolve().parent.parent
 
 def seed_field_definitions() -> int:
     """master_fields.json を field_definitions テーブルに投入"""
-    json_path = PROJECT_ROOT / "master_fields.json"
+    json_path = PROJECT_ROOT / "schemas" / "master_fields.json"
     if not json_path.exists():
         print(f"[SKIP] {json_path} が見つかりません")
         return 0
