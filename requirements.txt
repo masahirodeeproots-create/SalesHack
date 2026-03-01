@@ -1,0 +1,7 @@
+requests
+python-dotenv
+beautifulsoup4
+google-generativeai
+google-cloud-bigquery
+google-cloud-secret-manager
+playwright

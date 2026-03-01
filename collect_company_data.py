@@ -1,0 +1,719 @@
+"""
+collect_company_data.py
+=======================
+企業媒体URLから実データを収集し、field_mapper で正規化・統合してCSVに出力するパイプライン。
+
+処理フロー:
+  1. company_media_urls.csv から found のURL一覧をロード
+  2. 各URLをスクレイピングし、構造化フィールドを抽出
+  3. field_mapper で canonical 名にマッピング
+  4. 複数媒体の結果を source_priority に従って統合
+  5. 企業×フィールドのマトリクスCSVを出力
+"""
+
+import os
+import csv
+import json
+import re
+import time
+import logging
+import requests
+from collections import defaultdict
+from bs4 import BeautifulSoup
+from dotenv import load_dotenv
+from playwright.sync_api import sync_playwright, Browser
+
+from field_mapper import map_fields_with_gemini_fallback, merge_multi_source, parse_prtimes_press_releases
+
+load_dotenv()
+
+SCRAPINGDOG_API_KEY = os.getenv("SCRAPINGDOG_API_KEY")
+GEMINI_API_KEY = os.getenv("GEMINI_API_KEY")
+SCRAPINGDOG_SCRAPE_ENDPOINT = "https://api.scrapingdog.com/scrape"
+INPUT_CSV = "company_media_urls.csv"
+OUTPUT_CSV = "company_data_master.csv"
+CHECKPOINT_DIR = "checkpoints"
+REQUEST_INTERVAL = 1.0
+MAX_RETRIES = 3
+RETRY_BACKOFF_BASE = 2
+
+# JSレンダリングが必要な媒体（ScrapingDog dynamic使用）
+JS_RENDERED_MEDIA = {"マイナビ", "リクルートエージェント"}
+# React SPA等でPlaywrightが必要な媒体
+PLAYWRIGHT_MEDIA = {"PR TIMES"}
+
+logging.basicConfig(
+    level=logging.INFO,
+    format="%(asctime)s [%(levelname)s] %(message)s",
+    handlers=[
+        logging.FileHandler("collect_data.log", encoding="utf-8"),
+        logging.StreamHandler(),
+    ],
+)
+logger = logging.getLogger(__name__)
+
+
+# ---------------------------------------------------------------------------
+# HTML取得
+# ---------------------------------------------------------------------------
+
+def fetch_html(url: str) -> str | None:
+    """直接HTTPでHTML取得"""
+    headers = {
+        "User-Agent": (
+            "Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) "
+            "AppleWebKit/537.36 (KHTML, like Gecko) "
+            "Chrome/120.0.0.0 Safari/537.36"
+        )
+    }
+    try:
+        response = requests.get(url, headers=headers, timeout=20)
+        response.raise_for_status()
+        response.encoding = response.apparent_encoding
+        return response.text
+    except requests.exceptions.HTTPError as e:
+        logger.error(f"HTTP {e.response.status_code} - {url}")
+    except requests.exceptions.RequestException as e:
+        logger.error(f"リクエスト失敗 - {url} - {e}")
+    return None
+
+
+def fetch_html_scrapingdog(url: str) -> str | None:
+    """ScrapingDog API経由でJSレンダリング済みHTML取得"""
+    params = {
+        "api_key": SCRAPINGDOG_API_KEY,
+        "url": url,
+        "dynamic": "true",
+    }
+    for attempt in range(MAX_RETRIES + 1):
+        try:
+            response = requests.get(SCRAPINGDOG_SCRAPE_ENDPOINT, params=params, timeout=60)
+            if response.status_code == 502 and attempt < MAX_RETRIES:
+                wait = RETRY_BACKOFF_BASE ** attempt
+                logger.warning(f"ScrapingDog 502 - リトライ {attempt + 1}/{MAX_RETRIES} ({wait}秒後): {url}")
+                time.sleep(wait)
+                continue
+            response.raise_for_status()
+            response.encoding = response.apparent_encoding
+            return response.text
+        except requests.exceptions.HTTPError as e:
+            if e.response.status_code == 502 and attempt < MAX_RETRIES:
+                wait = RETRY_BACKOFF_BASE ** attempt
+                logger.warning(f"ScrapingDog 502 - リトライ {attempt + 1}/{MAX_RETRIES} ({wait}秒後): {url}")
+                time.sleep(wait)
+                continue
+            logger.error(f"ScrapingDog HTTP {e.response.status_code} - {url}")
+            return None
+        except requests.exceptions.RequestException as e:
+            logger.error(f"ScrapingDog リクエスト失敗 - {url} - {e}")
+            return None
+    return None
+
+
+def fetch_html_playwright(url: str, browser: Browser) -> str | None:
+    """Playwrightでブラウザレンダリング済みHTMLを取得（React SPA対応）"""
+    try:
+        page = browser.new_page()
+        page.goto(url, wait_until="networkidle", timeout=30000)
+        html = page.content()
+        page.close()
+        return html
+    except Exception as e:
+        logger.error(f"Playwright取得失敗 - {url} - {e}")
+        try:
+            page.close()
+        except Exception:
+            pass
+        return None
+
+
+# ---------------------------------------------------------------------------
+# フィールド抽出
+# ---------------------------------------------------------------------------
+
+def _find_content_root(soup: BeautifulSoup) -> "Tag | None":
+    """
+    ページのメインコンテンツ領域を特定する。
+    候補要素にdl/dt/ddまたはth/tdが含まれない場合はフォールバックする。
+    """
+    candidates = [
+        soup.find("main"),
+        soup.find("article"),
+        soup.find(id="main"),
+        soup.find(id="content"),
+        soup.find(id="wrapper"),       # マイナビ対応
+        soup.find(class_="main"),
+        soup.find(class_="content"),
+    ]
+    for el in candidates:
+        if el is None:
+            continue
+        # 実際にdl/dt/ddまたはth/tdを持つ要素のみ採用
+        if el.find("dl") or el.find("th"):
+            return el
+    # 全候補にデータがなければbodyにフォールバック
+    return soup.body
+
+
+def extract_structured_fields(html: str) -> dict[str, str]:
+    """HTMLからdl/dt/ddペアおよびth/tdペアを辞書形式で抽出"""
+    soup = BeautifulSoup(html, "html.parser")
+
+    for tag in soup(["script", "style", "noscript", "header", "footer", "nav", "form", "aside"]):
+        tag.decompose()
+
+    main = _find_content_root(soup)
+    if main is None:
+        return {}
+
+    fields = {}
+
+    # dl/dt/dd ペア
+    for dl in main.find_all("dl"):
+        terms = dl.find_all("dt")
+        descs = dl.find_all("dd")
+        for dt, dd in zip(terms, descs):
+            label = dt.get_text(strip=True)
+            value = dd.get_text(separator=" ", strip=True)
+            if label and value:
+                fields[label] = value
+
+    # テーブルの th/td ペア
+    for table in main.find_all("table"):
+        for row in table.find_all("tr"):
+            th = row.find("th")
+            td = row.find("td")
+            if th and td:
+                label = th.get_text(strip=True)
+                value = td.get_text(separator=" ", strip=True)
+                if label and value:
+                    fields[label] = value
+
+    return fields
+
+
+def extract_prtimes_fields(html: str) -> dict[str, str]:
+    """PR TIMESの企業ページから企業情報とプレスリリースを抽出"""
+    soup = BeautifulSoup(html, "html.parser")
+
+    for tag in soup(["script", "style", "noscript", "header", "footer", "nav"]):
+        tag.decompose()
+
+    fields = {}
+
+    # 企業情報: dl/dt/dd ペア
+    for dl in soup.find_all("dl"):
+        terms = dl.find_all("dt")
+        descs = dl.find_all("dd")
+        for dt, dd in zip(terms, descs):
+            label = dt.get_text(strip=True)
+            value = dd.get_text(separator=" ", strip=True)
+            if label and value:
+                fields[label] = value
+
+    # 企業情報: th/td テーブル
+    for table in soup.find_all("table"):
+        for row in table.find_all("tr"):
+            th = row.find("th")
+            td = row.find("td")
+            if th and td:
+                label = th.get_text(strip=True)
+                value = td.get_text(separator=" ", strip=True)
+                if label and value:
+                    fields[label] = value
+
+    # プレスリリース一覧（直近3件）
+    press_releases = []
+    pr_count = 0
+    for article in soup.find_all("article"):
+        if pr_count >= 3:
+            break
+        title_el = article.find(["h2", "h3", "h4"])
+        date_el = article.find("time") or article.find(class_=lambda c: c and "date" in c.lower())
+        if title_el:
+            title = title_el.get_text(strip=True)
+            date = date_el.get_text(strip=True) if date_el else ""
+            press_releases.append({"title": title, "date": date})
+            pr_count += 1
+
+    if press_releases:
+        fields["__press_releases__"] = json.dumps(press_releases, ensure_ascii=False)
+
+    return fields
+
+
+def extract_kyujin_urls(html: str) -> list[str]:
+    """リクルートエージェント企業ページから求人URLを抽出"""
+    soup = BeautifulSoup(html, "html.parser")
+    base_url = "https://www.r-agent.com"
+    urls = []
+    seen = set()
+    for a_tag in soup.find_all("a", href=True):
+        href = a_tag["href"]
+        if "/kensaku/kyujin/" in href and href.endswith(".html"):
+            if href.startswith("/"):
+                full_url = base_url + href
+            elif href.startswith("http"):
+                full_url = href
+            else:
+                continue
+            if full_url not in seen:
+                seen.add(full_url)
+                urls.append(full_url)
+    return urls
+
+
+def extract_similar_search_fields(html: str) -> dict[str, str]:
+    """リクルートエージェント求人ページの「この求人に似た求人を探す」セクションを解析"""
+    soup = BeautifulSoup(html, "html.parser")
+
+    target_h2 = None
+    for h2 in soup.find_all("h2"):
+        if "この求人に似た求人を探す" in h2.get_text():
+            target_h2 = h2
+            break
+    if target_h2 is None:
+        return {}
+
+    table = None
+    for sibling in target_h2.find_next_siblings():
+        if sibling.name == "table":
+            table = sibling
+            break
+        found = sibling.find("table")
+        if found:
+            table = found
+            break
+    if table is None:
+        return {}
+
+    raw_fields = {}
+    for row in table.find_all("tr"):
+        th = row.find("th")
+        td = row.find("td")
+        if th and td:
+            label = th.get_text(strip=True)
+            raw_fields[label] = td
+
+    result = {}
+    if "業界" in raw_fields:
+        td_el = raw_fields["業界"]
+        a_tags = td_el.find_all("a")
+        hierarchy = [a.get_text(strip=True) for a in a_tags]
+        for i in range(5):
+            result[f"業界_階層{i + 1}"] = hierarchy[i] if i < len(hierarchy) else ""
+    else:
+        for i in range(5):
+            result[f"業界_階層{i + 1}"] = ""
+
+    field_mapping = {
+        "職種": "職種_求人",
+        "勤務地": "勤務地_求人",
+        "スキル": "スキル",
+        "こだわり": "こだわり",
+    }
+    for raw_label, canonical_key in field_mapping.items():
+        if raw_label in raw_fields:
+            result[canonical_key] = raw_fields[raw_label].get_text(strip=True)
+        else:
+            result[canonical_key] = ""
+
+    return result
+
+
+# ---------------------------------------------------------------------------
+# みんかぶ（Minkabu）財務データ抽出
+# ---------------------------------------------------------------------------
+
+# 企業名 → 証券コードのマッピング（上場企業のみ）
+MINKABU_STOCK_CODES: dict[str, str] = {
+    "丸紅": "8002",
+    "岩谷産業": "8088",
+    "三井物産": "8031",
+    "三菱商事": "8058",
+    "三菱食品": "7451",
+    "住友商事": "8053",
+    "双日": "2768",
+    "アイフル": "8515",
+    "アコム": "8572",
+}
+
+
+def _parse_minkabu_table(table, target_metrics: list[str]) -> dict[str, list[tuple[str, str]]]:
+    """
+    みんかぶのテーブルを解析して、指定メトリクスの値を期別に返す。
+
+    Returns:
+        {metric_name: [(period, value), ...]}  ※最新期が先頭
+    """
+    rows = table.find_all("tr")
+    if not rows:
+        return {}
+
+    # ヘッダー行からメトリクス名のインデックスを取得
+    header_cells = rows[0].find_all("th")
+    header_names = [th.get_text(strip=True) for th in header_cells]
+
+    metric_indices: dict[str, int] = {}
+    for i, name in enumerate(header_names):
+        for target in target_metrics:
+            if target in name:
+                metric_indices[target] = i
+                break
+
+    if not metric_indices:
+        return {}
+
+    # データ行（th=期名, td=値）
+    result: dict[str, list[tuple[str, str]]] = {m: [] for m in metric_indices}
+
+    for row in rows[1:]:
+        th = row.find("th")
+        tds = row.find_all("td")
+        if not th or not tds:
+            continue
+
+        period_text = th.get_text(strip=True)
+        # 「2024年6月期(2024/08/14)」→ 「2024年6月期」
+        period = re.sub(r"\(.*?\)", "", period_text).strip()
+
+        for metric, idx in metric_indices.items():
+            td_idx = idx - 1  # thが最初の列なのでtdインデックスは-1
+            if 0 <= td_idx < len(tds):
+                val = tds[td_idx].get_text(strip=True)
+                result[metric].append((period, val))
+
+    return result
+
+
+def extract_minkabu_financial(html: str) -> dict[str, str]:
+    """
+    みんかぶの決算ページから財務指標を抽出する。
+    売上高・営業CF・フリーCF・自己資本率・ROE を複数期分取得し、
+    売上成長率も算出する。
+    """
+    soup = BeautifulSoup(html, "html.parser")
+    tables = soup.find_all("table")
+    result = {}
+
+    if len(tables) < 4:
+        logger.warning(f"みんかぶ: テーブル数不足 ({len(tables)})")
+        return result
+
+    # Table 0: 売上高・営業利益・経常利益・純利益
+    revenue_data = _parse_minkabu_table(tables[0], ["売上高", "営業利益"])
+    for metric, values in revenue_data.items():
+        for period, val in values:
+            result[f"minkabu_{metric}_{period}"] = val
+
+    # 売上成長率を算出
+    if "売上高" in revenue_data:
+        revenues = revenue_data["売上高"]
+        for i in range(len(revenues) - 1):
+            cur_period, cur_val = revenues[i]
+            prev_period, prev_val = revenues[i + 1]
+            try:
+                cur_num = float(cur_val.replace(",", "").replace("―", "0"))
+                prev_num = float(prev_val.replace(",", "").replace("―", "0"))
+                if prev_num != 0:
+                    growth = (cur_num - prev_num) / abs(prev_num) * 100
+                    result[f"minkabu_売上成長率_{cur_period}"] = f"{growth:.1f}%"
+            except (ValueError, ZeroDivisionError):
+                pass
+
+    # Table 1: 自己資本率
+    balance_data = _parse_minkabu_table(tables[1], ["自己資本率"])
+    for metric, values in balance_data.items():
+        for period, val in values:
+            result[f"minkabu_{metric}_{period}"] = val
+
+    # Table 2: ROE
+    roe_data = _parse_minkabu_table(tables[2], ["ROE"])
+    for metric, values in roe_data.items():
+        for period, val in values:
+            result[f"minkabu_{metric}_{period}"] = val
+
+    # Table 3: 営業CF・フリーCF
+    cf_data = _parse_minkabu_table(tables[3], ["営業CF", "フリーCF"])
+    for metric, values in cf_data.items():
+        for period, val in values:
+            result[f"minkabu_{metric}_{period}"] = val
+
+    return result
+
+
+# ---------------------------------------------------------------------------
+# チェックポイント管理
+# ---------------------------------------------------------------------------
+
+def load_checkpoint() -> dict:
+    """保存済みチェックポイントをロード"""
+    os.makedirs(CHECKPOINT_DIR, exist_ok=True)
+    cp_path = os.path.join(CHECKPOINT_DIR, "company_data_checkpoint.json")
+    if os.path.exists(cp_path):
+        with open(cp_path, encoding="utf-8") as f:
+            return json.load(f)
+    return {}
+
+
+def save_checkpoint(data: dict):
+    """チェックポイントを保存"""
+    os.makedirs(CHECKPOINT_DIR, exist_ok=True)
+    cp_path = os.path.join(CHECKPOINT_DIR, "company_data_checkpoint.json")
+    with open(cp_path, "w", encoding="utf-8") as f:
+        json.dump(data, f, ensure_ascii=False, indent=2)
+
+
+# ---------------------------------------------------------------------------
+# メインパイプライン
+# ---------------------------------------------------------------------------
+
+def main():
+    print("=" * 60)
+    print("企業データ収集パイプライン")
+    print("=" * 60)
+
+    # Geminiモデルの準備
+    gemini_model = None
+    if GEMINI_API_KEY:
+        import google.generativeai as genai
+        genai.configure(api_key=GEMINI_API_KEY)
+        gemini_model = genai.GenerativeModel("gemini-2.5-flash")
+        print("Gemini API: 有効（未解決フィールドのフォールバック用）")
+    else:
+        print("Gemini API: 無効（ルールベースのみ）")
+
+    # CSVロード
+    rows = []
+    with open(INPUT_CSV, newline="", encoding="utf-8-sig") as f:
+        for row in csv.DictReader(f):
+            if row["status"] == "found":
+                rows.append(row)
+    print(f"対象URL数: {len(rows)}件（found）")
+
+    # 企業→媒体→URL のマッピング
+    company_media_urls: dict[str, dict[str, str]] = defaultdict(dict)
+    for row in rows:
+        company_media_urls[row["企業名"]][row["媒体名"]] = row["URL"]
+
+    print(f"対象企業数: {len(company_media_urls)}社")
+
+    # Playwright ブラウザの起動（PR TIMES用）
+    playwright_ctx = None
+    pw_browser: Browser | None = None
+    need_playwright = any(
+        media in PLAYWRIGHT_MEDIA
+        for media_urls in company_media_urls.values()
+        for media in media_urls
+    )
+    if need_playwright:
+        playwright_ctx = sync_playwright().start()
+        pw_browser = playwright_ctx.chromium.launch(headless=True)
+        print("Playwright: 起動済み（PR TIMES React SPA対応）")
+
+    # チェックポイントロード
+    checkpoint = load_checkpoint()
+    # checkpoint structure: { "企業名": { "媒体名": { canonical: value } } }
+
+    try:
+        _run_pipeline(company_media_urls, checkpoint, gemini_model, pw_browser)
+    finally:
+        # Playwright クリーンアップ
+        if pw_browser:
+            pw_browser.close()
+        if playwright_ctx:
+            playwright_ctx.stop()
+            print("Playwright: 終了")
+
+
+def _run_pipeline(
+    company_media_urls: dict[str, dict[str, str]],
+    checkpoint: dict,
+    gemini_model,
+    pw_browser: Browser | None,
+):
+    """メインパイプラインの実行（Playwrightライフサイクルから分離）"""
+
+    # 各企業×媒体のスクレイピングとフィールド抽出
+    all_company_data: dict[str, dict[str, dict[str, str]]] = {}  # 企業名 → 媒体名 → {canonical: value}
+
+    for company, media_urls in company_media_urls.items():
+        print(f"\n{'─' * 50}")
+        print(f"▶ {company}（{len(media_urls)}媒体）")
+
+        company_sources = {}
+
+        for media_name, url in media_urls.items():
+            # チェックポイント確認
+            cp_key = f"{company}|{media_name}"
+            if cp_key in checkpoint:
+                print(f"  [{media_name}] チェックポイントから復元")
+                company_sources[media_name] = checkpoint[cp_key]
+                continue
+
+            use_scrapingdog = media_name in JS_RENDERED_MEDIA
+            use_playwright = media_name in PLAYWRIGHT_MEDIA
+            method = "(Playwright)" if use_playwright else "(ScrapingDog)" if use_scrapingdog else ""
+            print(f"  [{media_name}] HTML取得{method}: {url}")
+
+            if use_playwright and pw_browser:
+                html = fetch_html_playwright(url, pw_browser)
+            elif use_scrapingdog:
+                html = fetch_html_scrapingdog(url)
+            else:
+                html = fetch_html(url)
+            time.sleep(REQUEST_INTERVAL)
+
+            if html is None:
+                logger.warning(f"  スキップ: {company}/{media_name}")
+                continue
+
+            # フィールド抽出
+            if media_name == "PR TIMES":
+                raw_fields = extract_prtimes_fields(html)
+                # プレスリリースは別途処理
+                press_releases_json = raw_fields.pop("__press_releases__", "")
+            else:
+                raw_fields = extract_structured_fields(html)
+                press_releases_json = ""
+
+            if not raw_fields:
+                logger.warning(f"  フィールド抽出失敗: {company}/{media_name}")
+                continue
+
+            print(f"    抽出フィールド数: {len(raw_fields)}件")
+
+            # field_mapper で正規化
+            mapped = map_fields_with_gemini_fallback(
+                raw_fields, media_name, gemini_model
+            )
+
+            # PR TIMESのプレスリリースを追加
+            if press_releases_json:
+                mapped["プレスリリース"] = press_releases_json
+
+            print(f"    マッピング済み: {len(mapped)}件")
+
+            company_sources[media_name] = mapped
+
+            # チェックポイント保存
+            checkpoint[cp_key] = mapped
+            save_checkpoint(checkpoint)
+
+            # リクルートエージェント: 求人情報の追加取得（最初の1件のみ）
+            if media_name == "リクルートエージェント":
+                kyujin_urls = extract_kyujin_urls(html)
+                if kyujin_urls:
+                    print(f"    求人URL: {len(kyujin_urls)}件 → 最初の1件を取得")
+                    kyujin_html = fetch_html_scrapingdog(kyujin_urls[0])
+                    time.sleep(REQUEST_INTERVAL)
+                    if kyujin_html:
+                        kyujin_fields = extract_similar_search_fields(kyujin_html)
+                        if kyujin_fields:
+                            # 求人フィールドは既にcanonical名なのでそのままマージ
+                            for k, v in kyujin_fields.items():
+                                if v and k not in mapped:
+                                    mapped[k] = v
+                            print(f"    求人フィールド追加: {len(kyujin_fields)}件")
+
+                            # チェックポイント更新
+                            checkpoint[cp_key] = mapped
+                            save_checkpoint(checkpoint)
+
+        all_company_data[company] = company_sources
+
+    # --- みんかぶ財務データ収集 ---
+    print(f"\n{'=' * 60}")
+    print("みんかぶ 財務データ収集")
+    print("=" * 60)
+
+    minkabu_data: dict[str, dict[str, str]] = {}
+    for company in company_media_urls.keys():
+        stock_code = MINKABU_STOCK_CODES.get(company)
+        if not stock_code:
+            continue
+
+        cp_key = f"{company}|みんかぶ"
+        if cp_key in checkpoint:
+            print(f"  [{company}] チェックポイントから復元")
+            minkabu_data[company] = checkpoint[cp_key]
+            continue
+
+        url = f"https://minkabu.jp/stock/{stock_code}/settlement"
+        print(f"  [{company}] ({stock_code}) {url}")
+
+        html = fetch_html(url)
+        time.sleep(REQUEST_INTERVAL)
+
+        if html is None:
+            logger.warning(f"  みんかぶ取得失敗: {company}")
+            continue
+
+        financial = extract_minkabu_financial(html)
+        if financial:
+            minkabu_data[company] = financial
+            checkpoint[cp_key] = financial
+            save_checkpoint(checkpoint)
+            print(f"    ✓ {len(financial)}項目取得")
+        else:
+            logger.warning(f"  みんかぶ抽出失敗: {company}")
+
+    # 統合: source_priority に従って各企業の最終データを作成
+    print(f"\n{'=' * 60}")
+    print("データ統合中...")
+
+    final_data: dict[str, dict[str, str]] = {}
+    for company, sources in all_company_data.items():
+        merged = merge_multi_source(sources)
+        # みんかぶ財務データをマージ
+        if company in minkabu_data:
+            merged.update(minkabu_data[company])
+        final_data[company] = merged
+        print(f"  {company}: {len(merged)}フィールド")
+
+    # 全企業で使用されているcanonicalフィールドを収集（出力列として使用）
+    all_canonicals: set[str] = set()
+    for data in final_data.values():
+        all_canonicals.update(data.keys())
+
+    # master_fields.json のカテゴリ順にソート
+    schema_path = os.path.join(os.path.dirname(__file__), "master_fields.json")
+    with open(schema_path, encoding="utf-8") as f:
+        master_schema = json.load(f)
+
+    canonical_order = [field["canonical"] for field in master_schema["fields"]]
+    # スキーマにある順にソートし、スキーマにないものは末尾に
+    sorted_canonicals = [c for c in canonical_order if c in all_canonicals]
+    remaining = sorted(all_canonicals - set(sorted_canonicals))
+    sorted_canonicals.extend(remaining)
+
+    # CSV出力
+    fieldnames = ["企業名"] + sorted_canonicals
+    with open(OUTPUT_CSV, "w", newline="", encoding="utf-8-sig") as f:
+        writer = csv.DictWriter(f, fieldnames=fieldnames)
+        writer.writeheader()
+        for company in company_media_urls.keys():
+            row = {"企業名": company}
+            for canonical in sorted_canonicals:
+                row[canonical] = final_data.get(company, {}).get(canonical, "")
+            writer.writerow(row)
+
+    # サマリー
+    print(f"\n{'=' * 60}")
+    print(f"完了！結果を {OUTPUT_CSV} に保存しました。")
+    print(f"企業数: {len(final_data)}社")
+    print(f"フィールド数: {len(sorted_canonicals)}項目")
+
+    # フィールドごとの充填率
+    print(f"\n--- フィールド充填率 ---")
+    total_companies = len(final_data)
+    for canonical in sorted_canonicals:
+        filled = sum(1 for data in final_data.values() if data.get(canonical))
+        rate = filled / total_companies * 100
+        print(f"  {canonical}: {filled}/{total_companies} ({rate:.0f}%)")
+
+    print("=" * 60)
+
+
+if __name__ == "__main__":
+    main()

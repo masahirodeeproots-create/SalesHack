@@ -1,0 +1,30 @@
+[project]
+name = "company-data-collection"
+version = "0.1.0"
+description = "企業情報収集・HRサービス利用状況調査・営業架電管理"
+requires-python = ">=3.12"
+dependencies = [
+    # --- HTTP / Scraping ---
+    "requests",
+    "beautifulsoup4",
+    "lxml",
+    "playwright",
+    # --- AI ---
+    "google-generativeai",
+    # --- Database ---
+    "sqlalchemy>=2.0",
+    "psycopg2-binary",
+    "alembic",
+    # --- Config ---
+    "python-dotenv",
+]
+
+[project.optional-dependencies]
+dev = [
+    "pytest",
+    "ruff",
+]
+gcp = [
+    "google-cloud-secret-manager",
+    "google-cloud-bigquery",
+]
