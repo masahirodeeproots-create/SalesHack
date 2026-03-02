@@ -30,7 +30,9 @@ import json
 import logging
 import os
 import sys
+import threading
 import time
+from concurrent.futures import ThreadPoolExecutor
 from pathlib import Path
 from uuid import UUID
 
@@ -44,7 +46,9 @@ from db.connection import get_session
 from db.models import Company, PhoneNumber
 from collectors.contacts.page_fetcher import fetch_google_snippets
 from collectors.contacts.regex_extractor import extract_phones, extract_emails, has_contact_signals
-from collectors.contacts.gemini_analyzer import analyze_snippet, merge_results
+from collectors.contacts.gemini_analyzer import (
+    analyze_snippet, analyze_snippets_batch, merge_results, GeminiKeyPool,
+)
 from collectors.contacts.db_writer import write_contact_results
 
 # ---------------------------------------------------------------------------
@@ -65,6 +69,14 @@ logger = logging.getLogger(__name__)
 
 CHECKPOINT_FILE = CHECKPOINT_DIR / "contacts_checkpoint.json"
 GEMINI_INTERVAL = 1.5  # Gemini APIの呼び出し間隔（秒）
+BATCH_SIZE = 3          # 1回のGemini呼び出しで処理するスニペット数
+
+# GeminiキープールはモジュールロードI時に初期化（キーが1つでも動作）
+def _build_key_pool() -> GeminiKeyPool:
+    from config.settings import GEMINI_API_KEY, GEMINI_API_KEY_2, GEMINI_API_KEY_3
+    return GeminiKeyPool([k for k in [GEMINI_API_KEY, GEMINI_API_KEY_2, GEMINI_API_KEY_3] if k])
+
+_KEY_POOL: GeminiKeyPool = _build_key_pool()
 
 
 # ---------------------------------------------------------------------------
@@ -92,6 +104,27 @@ def save_checkpoint(done: set[str]) -> None:
 # ---------------------------------------------------------------------------
 # 企業一覧の取得
 # ---------------------------------------------------------------------------
+
+def _deduplicate_snippets(snippets):
+    """
+    電話番号が1つだけで同一番号のスニペットを1件に絞る。
+    複数電話番号・電話番号なしのスニペットはすべて残す。
+    """
+    from collectors.contacts.regex_extractor import extract_phones
+    single_phone: dict[str, object] = {}
+    others = []
+    for s in snippets:
+        phones = extract_phones(s.text)
+        if len(phones) == 1:
+            key = phones[0].normalized
+            if key not in single_phone:
+                single_phone[key] = s
+        else:
+            others.append(s)
+    result = list(single_phone.values())
+    result.extend(others)
+    return result
+
 
 def get_companies(session, limit: int | None = None) -> list[tuple[UUID, str]]:
     """(company_id, company_name) のリストを返す。"""
@@ -130,15 +163,37 @@ def process_company(
         logger.info(f"  連絡先情報なし: {company_name}")
         return True
 
-    # Gemini解析
-    all_results: list[dict] = []
-    for snippet in target_snippets:
-        phones = extract_phones(snippet.text)
-        emails = extract_emails(snippet.text)
+    # 重複除去
+    deduped = _deduplicate_snippets(target_snippets)
+    logger.info(f"  重複除去後: {len(deduped)}件 (元: {len(target_snippets)}件)")
 
-        result = analyze_snippet(snippet, phones, emails)
-        all_results.append(result)
-        time.sleep(GEMINI_INTERVAL)
+    # 3件ずつバッチに分割して並列Gemini呼び出し
+    batches = []
+    for i in range(0, len(deduped), BATCH_SIZE):
+        b = deduped[i:i + BATCH_SIZE]
+        batches.append((
+            b,
+            [extract_phones(s.text) for s in b],
+            [extract_emails(s.text) for s in b],
+        ))
+
+    def _worker(args):
+        batch, phones_list, emails_list, api_key = args
+        return analyze_snippets_batch(batch, phones_list, emails_list, api_key=api_key)
+
+    all_results: list[dict] = []
+    with ThreadPoolExecutor(max_workers=max(1, _KEY_POOL.count)) as executor:
+        futures = [
+            executor.submit(_worker, (batch, phones, emails, _KEY_POOL.get_key()))
+            for batch, phones, emails in batches
+        ]
+        for f in futures:
+            try:
+                all_results.append(f.result())
+            except Exception as e:
+                logger.error(f"バッチ処理エラー: {e}")
+
+    time.sleep(GEMINI_INTERVAL)  # 企業間インターバル
 
     # 結果マージ
     merged = merge_results(all_results)
@@ -228,6 +283,7 @@ def main() -> None:
             bq_rows = [
                 {
                     "企業名": companies.get(str(row.company_id), ""),
+                    "company_id": str(row.company_id),
                     "電話番号": row.number,
                     "ラベル": row.label or "",
                     "status": row.status or "",

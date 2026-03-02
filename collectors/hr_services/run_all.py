@@ -97,6 +97,12 @@ def run_scrapers(targets: list[str] | None = None):
             sys.path.insert(0, _project_root)
         try:
             from db.bigquery import upload_hr_service_usages_safe
+            from db.company_resolver import resolve_company_ids
+            # スクレイプ企業名 → PostgreSQL company_id を解決して付与
+            company_names = list({row["企業名"] for row in all_bq_rows if row.get("企業名")})
+            company_id_map = resolve_company_ids(company_names)
+            for row in all_bq_rows:
+                row["company_id"] = company_id_map.get(row.get("企業名"))
             upload_hr_service_usages_safe(all_bq_rows, min_ratio=0.9)
         except Exception as e:
             logger.error(f"BigQuery アップロード失敗: {e}", exc_info=True)

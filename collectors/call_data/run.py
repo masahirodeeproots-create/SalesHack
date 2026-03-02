@@ -107,9 +107,13 @@ def main() -> None:
     if os.getenv("UPLOAD_TO_BIGQUERY", "").lower() == "true":
         try:
             from db.bigquery import upload_call_logs
+            from db.company_resolver import resolve_company_ids
+            company_names = list({row.company_name for row in import_result.valid_rows})
+            company_id_map = resolve_company_ids(company_names)
             bq_rows = [
                 {
                     "company_name": row.company_name,
+                    "company_id": company_id_map.get(row.company_name),
                     "sales_rep_name": row.sales_rep_name,
                     "called_at": row.called_at,
                     "phone_number": row.phone_number,

@@ -11,6 +11,7 @@ main DBの company_field_values に口コミ評価データを書き込む。
 
 import csv
 import logging
+import os
 import sys
 import argparse
 from pathlib import Path
@@ -188,6 +189,37 @@ def run(csv_path: Path = DEFAULT_RESULTS_CSV):
     # 念のためCSVにも出力（data/output/en_hyouban_results.csv）
     out_csv = OUTPUT_DIR / "en_hyouban_results.csv"
     export_csv(rows, out_csv)
+
+    # BigQuery アップロード（UPLOAD_TO_BIGQUERY=true の場合）
+    if os.getenv("UPLOAD_TO_BIGQUERY", "").lower() == "true":
+        try:
+            from db.bigquery import upload_en_hyouban_reviews
+            from db.company_resolver import resolve_company_ids
+            company_names = [row.get("company_name", "").strip() for row in rows if row.get("company_name", "").strip()]
+            company_id_map = resolve_company_ids(list(set(company_names)))
+            bq_rows = []
+            for row in rows:
+                company_name = row.get("company_name", "").strip()
+                if not company_name:
+                    continue
+                bq_rows.append({
+                    "企業名": company_name,
+                    "company_id": company_id_map.get(company_name),
+                    "エン評判_総合スコア": row.get("total_score", "") or "",
+                    "エン評判_口コミ件数": row.get("review_count", "") or "",
+                    "エン評判_成長性": row.get("score_growth", "") or "",
+                    "エン評判_優位性": row.get("score_advantage", "") or "",
+                    "エン評判_実力主義": row.get("score_meritocracy", "") or "",
+                    "エン評判_風土": row.get("score_culture", "") or "",
+                    "エン評判_20代成長環境": row.get("score_youth", "") or "",
+                    "エン評判_社会貢献": row.get("score_contribution", "") or "",
+                    "エン評判_イノベーション": row.get("score_innovation", "") or "",
+                    "エン評判_経営陣": row.get("score_leadership", "") or "",
+                    "エン評判_口コミ本文": row.get("reviews_text", "") or "",
+                })
+            upload_en_hyouban_reviews(bq_rows)
+        except Exception as e:
+            logger.error(f"BigQuery アップロード失敗: {e}")
 
     elapsed = (datetime.now() - start).total_seconds()
     logger.info(f"同期完了: {written}フィールド書き込み | 所要時間: {elapsed:.1f}秒")

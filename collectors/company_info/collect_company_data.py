@@ -746,9 +746,11 @@ def _run_pipeline(
     if USE_SECRET_MANAGER or os.getenv("UPLOAD_TO_BIGQUERY", "").lower() == "true":
         try:
             from db.bigquery import upload_company_data
+            from db.company_resolver import resolve_company_ids
             print(f"\n{'=' * 60}")
             print("BigQuery アップロード中...")
-            upload_company_data(merged_all, sorted_canonicals, list(merged_all.keys()))
+            company_id_map = resolve_company_ids(list(merged_all.keys()))
+            upload_company_data(merged_all, sorted_canonicals, list(merged_all.keys()), company_id_map)
         except Exception as e:
             logger.error(f"BigQuery アップロード失敗: {e}")
             print(f"BigQuery アップロード失敗: {e}")

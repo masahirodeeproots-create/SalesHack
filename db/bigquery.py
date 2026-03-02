@@ -27,6 +27,7 @@ def upload_company_data(
     final_data: dict[str, dict[str, str]],
     sorted_canonicals: list[str],
     company_order: list[str],
+    company_id_map: dict[str, str | None] | None = None,
 ) -> None:
     """
     企業データを BigQuery にアップロードする。
@@ -36,6 +37,7 @@ def upload_company_data(
         final_data:        {企業名: {canonical: value}} の辞書
         sorted_canonicals: 出力するフィールド名の順序付きリスト
         company_order:     企業の出力順
+        company_id_map:    {企業名: company_id (UUID文字列 or None)} の辞書（省略可）
     """
     client = _get_client()
     table_id = _build_table_id()
@@ -43,6 +45,7 @@ def upload_company_data(
     # スキーマ定義（全フィールドを STRING として格納）
     schema = [
         bigquery.SchemaField("企業名", "STRING", mode="REQUIRED"),
+        bigquery.SchemaField("company_id", "STRING", mode="NULLABLE"),
     ]
     for canonical in sorted_canonicals:
         schema.append(bigquery.SchemaField(canonical, "STRING", mode="NULLABLE"))
@@ -59,7 +62,11 @@ def upload_company_data(
     now = datetime.now(timezone.utc).isoformat()
     rows = []
     for company in company_order:
-        row = {"企業名": company, "updated_at": now}
+        row = {
+            "企業名": company,
+            "company_id": company_id_map.get(company) if company_id_map else None,
+            "updated_at": now,
+        }
         for canonical in sorted_canonicals:
             row[canonical] = final_data.get(company, {}).get(canonical, "")
         rows.append(row)
@@ -82,6 +89,7 @@ def upload_company_data(
 
 _HR_SERVICE_USAGES_SCHEMA = [
     bigquery.SchemaField("企業名", "STRING", mode="REQUIRED"),
+    bigquery.SchemaField("company_id", "STRING", mode="NULLABLE"),
     bigquery.SchemaField("サービス名", "STRING", mode="NULLABLE"),
     bigquery.SchemaField("タイトル", "STRING", mode="NULLABLE"),
     bigquery.SchemaField("掲載日", "STRING", mode="NULLABLE"),
@@ -169,6 +177,7 @@ def upload_contacts(rows: list[dict]) -> None:
 
     schema = [
         bigquery.SchemaField("企業名", "STRING", mode="REQUIRED"),
+        bigquery.SchemaField("company_id", "STRING", mode="NULLABLE"),
         bigquery.SchemaField("電話番号", "STRING", mode="NULLABLE"),
         bigquery.SchemaField("ラベル", "STRING", mode="NULLABLE"),
         bigquery.SchemaField("status", "STRING", mode="NULLABLE"),
@@ -210,6 +219,7 @@ def upload_call_logs(rows: list[dict]) -> None:
 
     schema = [
         bigquery.SchemaField("company_name", "STRING", mode="REQUIRED"),
+        bigquery.SchemaField("company_id", "STRING", mode="NULLABLE"),
         bigquery.SchemaField("sales_rep_name", "STRING", mode="NULLABLE"),
         bigquery.SchemaField("called_at", "TIMESTAMP", mode="NULLABLE"),
         bigquery.SchemaField("phone_number", "STRING", mode="NULLABLE"),
@@ -234,6 +244,7 @@ def upload_call_logs(rows: list[dict]) -> None:
     for row in rows:
         bq_row = {
             "company_name": row.get("company_name", ""),
+            "company_id": row.get("company_id"),
             "sales_rep_name": row.get("sales_rep_name"),
             "called_at": row["called_at"].isoformat() if row.get("called_at") else None,
             "phone_number": row.get("phone_number"),
@@ -259,4 +270,56 @@ def upload_call_logs(rows: list[dict]) -> None:
     job.result()
 
     logger.info(f"BigQuery (call_logs) アップロード完了: {len(bq_rows)}行")
+    print(f"BigQuery アップロード完了: {len(bq_rows)}行 → {table_id}")
+
+
+_EN_HYOUBAN_SCHEMA = [
+    bigquery.SchemaField("企業名", "STRING", mode="REQUIRED"),
+    bigquery.SchemaField("company_id", "STRING", mode="NULLABLE"),
+    bigquery.SchemaField("エン評判_総合スコア", "STRING", mode="NULLABLE"),
+    bigquery.SchemaField("エン評判_口コミ件数", "STRING", mode="NULLABLE"),
+    bigquery.SchemaField("エン評判_成長性", "STRING", mode="NULLABLE"),
+    bigquery.SchemaField("エン評判_優位性", "STRING", mode="NULLABLE"),
+    bigquery.SchemaField("エン評判_実力主義", "STRING", mode="NULLABLE"),
+    bigquery.SchemaField("エン評判_風土", "STRING", mode="NULLABLE"),
+    bigquery.SchemaField("エン評判_20代成長環境", "STRING", mode="NULLABLE"),
+    bigquery.SchemaField("エン評判_社会貢献", "STRING", mode="NULLABLE"),
+    bigquery.SchemaField("エン評判_イノベーション", "STRING", mode="NULLABLE"),
+    bigquery.SchemaField("エン評判_経営陣", "STRING", mode="NULLABLE"),
+    bigquery.SchemaField("エン評判_口コミ本文", "STRING", mode="NULLABLE"),
+    bigquery.SchemaField("updated_at", "TIMESTAMP", mode="REQUIRED"),
+]
+
+
+def upload_en_hyouban_reviews(rows: list[dict]) -> None:
+    """
+    エン カイシャの評判データを BigQuery にアップロードする。
+    既存データは全件置換（WRITE_TRUNCATE）。
+
+    Args:
+        rows: [{"企業名": str, "company_id": str|None,
+                "エン評判_総合スコア": str, "エン評判_口コミ件数": str,
+                "エン評判_成長性": str, ...}, ...]
+    """
+    if not rows:
+        logger.warning("BigQuery (en_hyouban_reviews): アップロード対象のデータがありません")
+        return
+
+    client = _get_client()
+    table_id = f"{GCP_PROJECT_ID}.{BQ_DATASET}.en_hyouban_reviews"
+
+    table = bigquery.Table(table_id, schema=_EN_HYOUBAN_SCHEMA)
+    client.create_table(table, exists_ok=True)
+
+    now = datetime.now(timezone.utc).isoformat()
+    bq_rows = [{**row, "updated_at": now} for row in rows]
+
+    job_config = bigquery.LoadJobConfig(
+        schema=_EN_HYOUBAN_SCHEMA,
+        write_disposition=bigquery.WriteDisposition.WRITE_TRUNCATE,
+    )
+    job = client.load_table_from_json(bq_rows, table_id, job_config=job_config)
+    job.result()
+
+    logger.info(f"BigQuery (en_hyouban_reviews) アップロード完了: {len(bq_rows)}行")
     print(f"BigQuery アップロード完了: {len(bq_rows)}行 → {table_id}")
