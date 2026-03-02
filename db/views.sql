@@ -156,3 +156,47 @@ FROM field_definitions fd
 LEFT JOIN company_field_values v ON fd.id = v.field_id
 GROUP BY fd.id, fd.canonical_name, fd.category
 ORDER BY fd.display_order;
+
+-- -----------------------------------------------------------
+-- 8. 収集進捗ダッシュボードビュー（リアルタイム観測用）
+-- -----------------------------------------------------------
+CREATE OR REPLACE VIEW v_collection_progress AS
+WITH total AS (SELECT COUNT(*) AS n FROM companies)
+SELECT
+    fd.category                                                      AS カテゴリ,
+    fd.canonical_name                                                AS フィールド名,
+    COUNT(v.id)                                                      AS 取得済み社数,
+    total.n                                                          AS 全社数,
+    ROUND(COUNT(v.id)::numeric / NULLIF(total.n, 0) * 100, 1)       AS 充填率,
+    MAX(v.scraped_at)                                                AS 最終取得日時,
+    COUNT(DISTINCT v.source)                                         AS ソース数
+FROM field_definitions fd
+CROSS JOIN total
+LEFT JOIN company_field_values v ON fd.id = v.field_id
+GROUP BY fd.id, fd.canonical_name, fd.category, fd.display_order, total.n
+ORDER BY fd.display_order;
+
+-- -----------------------------------------------------------
+-- 9. 企業ごとの収集完了率ビュー
+-- -----------------------------------------------------------
+CREATE OR REPLACE VIEW v_company_coverage AS
+WITH total_fields AS (SELECT COUNT(*) AS n FROM field_definitions),
+     per_company AS (
+         SELECT company_id, COUNT(*) AS filled_fields
+         FROM company_field_values
+         GROUP BY company_id
+     )
+SELECT
+    c.name_normalized                                                AS 企業名,
+    c.stock_code                                                     AS 証券コード,
+    COALESCE(pc.filled_fields, 0)                                    AS 取得済みフィールド数,
+    tf.n                                                             AS 全フィールド数,
+    ROUND(COALESCE(pc.filled_fields, 0)::numeric / tf.n * 100, 1)   AS 充填率,
+    EXISTS(SELECT 1 FROM phone_numbers pn WHERE pn.company_id = c.id) AS 電話あり,
+    EXISTS(SELECT 1 FROM company_persons cp WHERE cp.company_id = c.id) AS 担当者あり,
+    EXISTS(SELECT 1 FROM company_service_usage csu WHERE csu.company_id = c.id) AS HRサービスあり,
+    c.updated_at                                                     AS 最終更新
+FROM companies c
+CROSS JOIN total_fields tf
+LEFT JOIN per_company pc ON c.id = pc.company_id
+ORDER BY pc.filled_fields DESC NULLS LAST;
