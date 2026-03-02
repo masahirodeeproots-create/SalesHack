@@ -31,7 +31,9 @@ import logging
 import os
 import requests
 import sys
+import threading
 import time
+from concurrent.futures import ThreadPoolExecutor
 from datetime import datetime
 from pathlib import Path
 
@@ -139,7 +141,9 @@ from collectors.contacts.page_fetcher import Snippet
 from collectors.contacts.regex_extractor import (
     extract_phones, extract_emails, has_contact_signals,
 )
-from collectors.contacts.gemini_analyzer import analyze_snippet, merge_results
+from collectors.contacts.gemini_analyzer import (
+    analyze_snippet, analyze_snippets_batch, merge_results, GeminiKeyPool,
+)
 
 
 # ─────────────────────────────────────────────────────────────────────────────
@@ -210,31 +214,35 @@ def run_step2():
 _CONTACTS_OUTPUT_CSV = str(OUTPUT_DIR / "contacts_experiment.csv")
 _CONTACTS_REQUEST_INTERVAL = 3.0  # ScrapingDog API制限対策（秒）
 _GEMINI_INTERVAL = 1.5            # Gemini API呼び出し間隔（秒）
+_BATCH_SIZE = 3                   # 1回のGemini呼び出しで処理するスニペット数
 
-# 連絡先収集用Google検索クエリテンプレート
+# 連絡先収集用Google検索クエリテンプレート（2クエリに削減）
 _CONTACT_SEARCH_QUERIES = [
+    "{company} 採用担当 メールアドレス",
     "{company} 採用担当 電話番号",
-    "{company} 人事部 採用窓口 連絡先",
-    "{company} 採用 メールアドレス",
 ]
+
+# GeminiキープールをStep3で共有（キーが1つでも動作、追加で自動的に並列化）
+def _build_key_pool() -> GeminiKeyPool:
+    from config.settings import GEMINI_API_KEY, GEMINI_API_KEY_2, GEMINI_API_KEY_3
+    return GeminiKeyPool([k for k in [GEMINI_API_KEY, GEMINI_API_KEY_2, GEMINI_API_KEY_3] if k])
+
+_KEY_POOL: GeminiKeyPool = _build_key_pool()
 
 
 def _fetch_google_snippets(company_name: str) -> list[Snippet]:
-    """ScrapingDog Google検索で1ページ目のスニペットをSnippetリストで返す"""
+    """ScrapingDog Google検索で1ページ目のスニペットをSnippetリストで返す（2クエリ並列実行）"""
     api_key = os.getenv("SCRAPINGDOG_API_KEY")
     if not api_key:
         logger.error("SCRAPINGDOG_API_KEY が設定されていません")
         return []
 
-    all_snippets: list[Snippet] = []
-    snippet_id = 0
-
-    for query_tmpl in _CONTACT_SEARCH_QUERIES:
+    def _fetch_single(query_tmpl: str) -> list[dict]:
         query = query_tmpl.format(company=company_name)
         params = {
             "api_key": api_key,
             "query": query,
-            "results": 10,  # 1ページ目全件
+            "results": 10,
             "country": "jp",
         }
         try:
@@ -243,27 +251,59 @@ def _fetch_google_snippets(company_name: str) -> list[Snippet]:
                 params=params, timeout=30,
             )
             if resp.status_code == 200:
-                data = resp.json()
-                for r in data.get("organic_results", []):
-                    title = r.get("title", "")
-                    snippet = r.get("snippet", "")
-                    url = r.get("link", "")
-                    text = f"{title} {snippet}".strip()
-                    if len(text) >= 20:
-                        all_snippets.append(Snippet(
-                            snippet_id=snippet_id,
-                            text=text,
-                            source_url=url or "google_search",
-                            html_tag="search_result",
-                        ))
-                        snippet_id += 1
+                return resp.json().get("organic_results", [])
             else:
                 logger.warning(f"ScrapingDog {resp.status_code}: {query}")
         except Exception as e:
             logger.warning(f"連絡先検索エラー [{company_name}]: {e}")
-        time.sleep(_CONTACTS_REQUEST_INTERVAL)
+        return []
 
+    # 2クエリを並列実行
+    with ThreadPoolExecutor(max_workers=2) as executor:
+        futures = [executor.submit(_fetch_single, tmpl) for tmpl in _CONTACT_SEARCH_QUERIES]
+        organic_results_lists = [f.result() for f in futures]
+
+    # 結果をSnippetリストに変換（snippet_idは通し番号）
+    all_snippets: list[Snippet] = []
+    snippet_id = 0
+    for organic_results in organic_results_lists:
+        for r in organic_results:
+            title = r.get("title", "")
+            snippet = r.get("snippet", "")
+            url = r.get("link", "")
+            text = f"{title} {snippet}".strip()
+            if len(text) >= 20:
+                all_snippets.append(Snippet(
+                    snippet_id=snippet_id,
+                    text=text,
+                    source_url=url or "google_search",
+                    html_tag="search_result",
+                ))
+                snippet_id += 1
+
+    # API制限のため並列完了後に1回インターバル
+    time.sleep(_CONTACTS_REQUEST_INTERVAL)
     return all_snippets
+
+
+def _deduplicate_snippets(snippets: list[Snippet]) -> list[Snippet]:
+    """
+    電話番号が1つだけで、その番号（正規化済み）が全く同じスニペットを1件に絞る。
+    複数電話番号を含むスニペット・電話番号なしのスニペットはすべて残す。
+    """
+    single_phone: dict[str, Snippet] = {}
+    others: list[Snippet] = []
+    for s in snippets:
+        phones = extract_phones(s.text)
+        if len(phones) == 1:
+            key = phones[0].normalized
+            if key not in single_phone:
+                single_phone[key] = s
+        else:
+            others.append(s)
+    result = list(single_phone.values())
+    result.extend(others)
+    return result
 
 
 def run_step3():
@@ -308,16 +348,46 @@ def run_step3():
                 })
                 continue
 
-            # 各スニペットを個別にGeminiで解析
-            results = []
-            for snippet in target_snippets:
-                phones = extract_phones(snippet.text)
-                emails = extract_emails(snippet.text)
-                result = analyze_snippet(snippet, phones, emails)
-                results.append(result)
-                time.sleep(_GEMINI_INTERVAL)
+            # 重複除去
+            deduped = _deduplicate_snippets(target_snippets)
+            logger.info(
+                f"  重複除去後: {len(deduped)}件 (元: {len(target_snippets)}件)"
+            )
 
-            merged = merge_results(results)
+            # 3件ずつバッチに分割
+            batches = []
+            for i in range(0, len(deduped), _BATCH_SIZE):
+                b = deduped[i:i + _BATCH_SIZE]
+                batches.append((
+                    b,
+                    [extract_phones(s.text) for s in b],
+                    [extract_emails(s.text) for s in b],
+                ))
+
+            # バッチを KEY_POOL.count 並列で処理
+            def _analyze_batch_worker(args):
+                batch, phones_list, emails_list, api_key = args
+                return analyze_snippets_batch(batch, phones_list, emails_list, api_key=api_key)
+
+            batch_results = []
+            with ThreadPoolExecutor(max_workers=max(1, _KEY_POOL.count)) as executor:
+                futures = [
+                    executor.submit(
+                        _analyze_batch_worker,
+                        (batch, phones, emails, _KEY_POOL.get_key()),
+                    )
+                    for batch, phones, emails in batches
+                ]
+                for f in futures:
+                    try:
+                        batch_results.append(f.result())
+                    except Exception as e:
+                        logger.error(f"バッチ処理エラー: {e}")
+
+            # Gemini APIレート制限のため企業間インターバル
+            time.sleep(_GEMINI_INTERVAL)
+
+            merged = merge_results(batch_results)
 
             phones_str = "; ".join(
                 "{num}({office}{dept})".format(

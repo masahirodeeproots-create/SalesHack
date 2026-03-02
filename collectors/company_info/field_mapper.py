@@ -186,7 +186,7 @@ def map_fields(
                 )
         else:
             unmapped[label] = value
-            logger.debug(f"[{media_name}] 未解決ラベル: '{label}' = '{value[:30]}'")
+            logger.info(f"[{media_name}] 未解決ラベル: '{label}' = '{value[:30]}'")
 
     return {"mapped": mapped, "unmapped": unmapped}
 
@@ -212,6 +212,42 @@ def map_fields_with_gemini_fallback(
     mapped = result["mapped"]
     unmapped = result["unmapped"]
 
+    if not unmapped:
+        return mapped
+
+    # ── Gemini fallback 前にナビゲーション/UIラベルをスキップ ──
+    _GEMINI_SKIP_LABELS: set[str] = {
+        # リクナビ ナビゲーション・会員登録誘導
+        "会員の方はこちら", "まだ会員でない方は", "ログイン / 新規会員登録",
+        "OpenES", "内々定",
+        # リクナビ 給与形態選択肢（ラジオボタン等）
+        "時給制、日給制、週給制、月給制", "年俸制、半期年俸制",
+        # リクナビ フォーム注釈・操作案内
+        "その他のポイント", "注意事項", "応募方法",
+        "セミナー／説明会", "直近の説明会・面接",
+        "お知らせ・イベント",
+        # エントリー管理
+        "エントリー完了企業", "エントリーできなかった企業",
+        # マイナビ 年度見出し系（例: "2026年卒採用情報" 等）
+        # ※ 年度数値は文字列に含めず prefix で判定
+    }
+
+    def _should_skip(label: str) -> bool:
+        if label in _GEMINI_SKIP_LABELS:
+            return True
+        # 「セミナー／説明会（全N件）」「セミナー・説明会」等のパターン
+        if label.startswith("セミナー") or label.startswith("説明会"):
+            return True
+        # 年度見出し（例: "2025年卒採用情報", "2026年卒情報" 等）
+        if "年卒" in label and ("採用情報" in label or "情報" in label):
+            return True
+        return False
+
+    unmapped = {k: v for k, v in unmapped.items() if not _should_skip(k)}
+    if unmapped:
+        logger.debug(
+            f"[{media_name}] スキップリスト適用後: {len(unmapped)}件がGemini fallbackへ"
+        )
     if not unmapped:
         return mapped
 

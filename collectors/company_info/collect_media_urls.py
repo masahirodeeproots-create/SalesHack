@@ -1,8 +1,10 @@
 import os
 import sys
 import csv
+import threading
 import time
 import requests
+from concurrent.futures import ThreadPoolExecutor, as_completed
 from pathlib import Path
 from dotenv import load_dotenv
 
@@ -18,38 +20,108 @@ load_dotenv()
 SCRAPINGDOG_API_KEY = os.getenv("SCRAPINGDOG_API_KEY")
 SCRAPINGDOG_ENDPOINT = "https://api.scrapingdog.com/google"
 
-# 対象企業名リスト（30社 - テスト用）
+# 対象企業名リスト（100社）
 COMPANIES = [
-    "株式会社テレコメディア",
-    "株式会社ジェイ・エム・エス",
-    "株式会社トーカイ",
-    "株式会社トーコー",
-    "株式会社トモ",
-    "株式会社トヨタエンタプライズ",
-    "株式会社トライトエンジニアリング",
-    "株式会社トライトキャリア",
-    "株式会社日本管財環境サービス",
-    "株式会社アントワークス",
-    "株式会社カネスエ",
-    "株式会社ニコン日総プライム",
-    "株式会社にしけい",
-    "株式会社ニチイ学館",
-    "株式会社ニチダン",
-    "株式会社ニッコー",
-    "株式会社ニフス",
-    "株式会社ネオキャリア",
-    "株式会社ネクスコ・サポート北海道",
-    "株式会社ネクスコ東日本エンジニアリング",
-    "株式会社ネクスコ東日本リテイル",
-    "株式会社ノア・ビルサービス",
-    "株式会社ノバレーゼ",
-    "株式会社ノムラクリーニング",
-    "株式会社今仙電機製作所",
-    "株式会社パソナ",
-    "株式会社パソナＨＳ",
-    "株式会社パソナ日本総務部",
-    "エルケア株式会社",
-    "株式会社カルラ",
+    "株式会社Ｏｎｅ",
+    "株式会社アクシーズ",
+    "株式会社ホーブ",
+    "株式会社ホクリヨウ",
+    "株式会社マース",
+    "株式会社秋川牧園",
+    "Ｋ＆Ｏエナジーグループ株式会社",
+    "株式会社ＩＮＰＥＸ",
+    "石油資源開発株式会社",
+    "日鉄鉱業株式会社",
+    "ＮＥＸＴ ＳＴＡＧＥ株式会社",
+    "ａｒｔｉｅｎｃｅ株式会社",
+    "株式会社高松コンストラクショングループ",
+    "インフロニア・ホールディングス株式会社",
+    "エクシオグループ株式会社",
+    "オプティマス株式会社",
+    "ＡＳＴＩ株式会社",
+    "ＢＩＰＲＯＧＹ株式会社",
+    "ＣＫＤ株式会社",
+    "サンユー建設株式会社",
+    "ベース株式会社",
+    "ＤＡＩＫＯ ＸＴＥＣＨ株式会社",
+    "シンクレイヤ株式会社",
+    "ＤＩＣ株式会社",
+    "ＤＭ三井製糖株式会社",
+    "ＤＯＷＡホールディングス株式会社",
+    "ＥＩＺＯ株式会社",
+    "ＥＮＥＯＳ株式会社",
+    "株式会社ソフトクリエイト",
+    "ダイダン株式会社",
+    "タマホーム株式会社",
+    "テスホールディングス株式会社",
+    "ＦＤＫ株式会社",
+    "ＧＭＢ株式会社",
+    "ピーエス・コンストラクション株式会社",
+    "株式会社東名",
+    "フクヤ建設株式会社",
+    "ＧＭＯペパボ株式会社",
+    "ベクトル株式会社",
+    "株式会社キューブシステム",
+    "ＨＯＹＡ株式会社",
+    "メタウォーター株式会社",
+    "ＡＩ ＣＲＯＳＳ株式会社",
+    "株式会社ＲＯＢＯＴ ＰＡＹＭＥＮＴ",
+    "ライト工業株式会社",
+    "株式会社ニーズウェル",
+    "レイズネクスト株式会社",
+    "ＪＢＣＣホールディングス株式会社",
+    "ＪＣＲファーマ株式会社",
+    "株式会社ジェイテック",
+    "株式会社ＣＳＣ",
+    "株式会社ＥＴＳ",
+    "ＪＦＥシステムズ株式会社",
+    "株式会社ＩＰＳ",
+    "株式会社ＲＩＳＥ",
+    "株式会社ＴＢＳ",
+    "株式会社アバント",
+    "株式会社アークス",
+    "株式会社アートフォースジャパン",
+    "株式会社アイダ設計",
+    "株式会社アクアライン",
+    "株式会社スタメン",
+    "株式会社イシン",
+    "株式会社ウィル",
+    "株式会社ウチヤマ",
+    "株式会社エージェント",
+    "ＡＧＳ株式会社",
+    "ＡＲアドバンストテクノロジ株式会社",
+    "ＪＴＰ株式会社",
+    "ＪＵＫＩ株式会社",
+    "株式会社キムラ",
+    "株式会社きんでん",
+    "株式会社ナカノフドー建設",
+    "ＪＸ金属株式会社",
+    "株式会社クラフティア",
+    "株式会社グリーンエナジー＆カンパニー",
+    "ＫＤＤＩ株式会社",
+    "ＫＨネオケム株式会社",
+    "株式会社イチケン",
+    "ＫＬＡＳＳ株式会社",
+    "ＫＯＡ株式会社",
+    "ＬＩＮＥヤフー株式会社",
+    "株式会社シンカ",
+    "株式会社クロップス",
+    "株式会社セイノー",
+    "株式会社セレコーポレーション",
+    "株式会社タスキ",
+    "ＮＣＤ株式会社",
+    "株式会社トーエネック",
+    "株式会社トミタ",
+    "株式会社オロ",
+    "株式会社ニューテック",
+    "株式会社ノバック",
+    "ＮＩＳＳＨＡ株式会社",
+    "ＮＩＴＴＯＫＵ株式会社",
+    "株式会社ファーストステージ",
+    "日本電技株式会社",
+    "ＮＯＫ株式会社",
+    "株式会社クロス・マーケティング",
+    "株式会社みらい",
 ]
 
 # 各媒体の設定
@@ -91,9 +163,11 @@ MEDIA_CONFIG = {
 
 OUTPUT_DIR.mkdir(parents=True, exist_ok=True)
 OUTPUT_CSV = str(OUTPUT_DIR / "company_media_urls.csv")
-REQUEST_INTERVAL = 3.0  # API制限対策（秒）
+REQUEST_INTERVAL = 1.0  # 各スレッド完了後のインターバル（秒）
 MAX_RETRIES = 3         # ScrapingDog 502エラー時の最大リトライ回数
 RETRY_BACKOFF_BASE = 2  # リトライ待機時間の底（秒）: 2^n 秒ずつ増加
+MAX_WORKERS = 5         # 最大並列検索数
+_request_semaphore = threading.Semaphore(MAX_WORKERS)  # 同時リクエスト数を制御
 
 
 def search_google(query: str) -> list:
@@ -151,42 +225,63 @@ def find_matching_url(urls: list, url_prefixes: list) -> str:
     return ""
 
 
+def _search_task(company: str, media_name: str, config: dict) -> dict:
+    """1件の検索タスク（セマフォで同時実行数を制御）"""
+    query = f"{company} {config['query_suffix']}"
+    with _request_semaphore:
+        urls = search_google(query)
+        time.sleep(REQUEST_INTERVAL)  # セマフォ内で待機（レート制限）
+
+    matched_url = find_matching_url(urls, config["url_prefixes"])
+    status = "found" if matched_url else "not_found"
+    marker = "✓" if matched_url else "✗"
+    print(f"  [{company}][{media_name}] {marker} {matched_url or 'not found'}")
+    return {
+        "企業名": company,
+        "媒体名": media_name,
+        "URL": matched_url,
+        "status": status,
+    }
+
+
 def main():
     print("=" * 60)
-    print("企業媒体URL収集スクリプト")
+    print("企業媒体URL収集スクリプト（5並列）")
     print(f"対象企業数: {len(COMPANIES)}社 / 対象媒体数: {len(MEDIA_CONFIG)}媒体")
     print(f"合計検索数: {len(COMPANIES) * len(MEDIA_CONFIG)}件")
     print("=" * 60)
 
-    results = []
+    # 全タスクを作成
+    tasks = [
+        (company, media_name, config)
+        for company in COMPANIES
+        for media_name, config in MEDIA_CONFIG.items()
+    ]
 
-    for company in COMPANIES:
-        print(f"\n▶ {company}")
+    results_map: dict[tuple, dict] = {}
 
-        for media_name, config in MEDIA_CONFIG.items():
-            query = f"{company} {config['query_suffix']}"
-            print(f"  [{media_name}] 検索: {query}")
+    with ThreadPoolExecutor(max_workers=MAX_WORKERS) as executor:
+        future_to_key = {
+            executor.submit(_search_task, company, media_name, config): (company, media_name)
+            for company, media_name, config in tasks
+        }
+        for future in as_completed(future_to_key):
+            key = future_to_key[future]
+            try:
+                results_map[key] = future.result()
+            except Exception as e:
+                company, media_name = key
+                print(f"  [{company}][{media_name}] エラー: {e}")
+                results_map[key] = {
+                    "企業名": company,
+                    "媒体名": media_name,
+                    "URL": "",
+                    "status": "error",
+                }
 
-            urls = search_google(query)
-            matched_url = find_matching_url(urls, config["url_prefixes"])
+    # 元の順序に並べ替えて CSV 出力
+    results = [results_map[(c, m)] for c, m, _ in tasks if (c, m) in results_map]
 
-            if matched_url:
-                status = "found"
-                print(f"    ✓ {matched_url}")
-            else:
-                status = "not_found"
-                print(f"    ✗ not found")
-
-            results.append({
-                "企業名": company,
-                "媒体名": media_name,
-                "URL": matched_url,
-                "status": status,
-            })
-
-            time.sleep(REQUEST_INTERVAL)
-
-    # CSV出力（BOM付きUTF-8でExcelでも開ける）
     with open(OUTPUT_CSV, "w", newline="", encoding="utf-8-sig") as f:
         fieldnames = ["企業名", "媒体名", "URL", "status"]
         writer = csv.DictWriter(f, fieldnames=fieldnames)

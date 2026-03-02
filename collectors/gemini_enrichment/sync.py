@@ -46,8 +46,8 @@ NUM = ["①", "②", "③"]
 FIELDS_SIMILAR = [f"類似企業{n}（同規模・同エリア・同業）" for n in NUM]
 FIELDS_COMPETITOR = [f"直接競合企業{n}" for n in NUM]
 
-# Gemini API のレート制限対策（無料枠: 15 RPM）
-WAIT_BETWEEN_CALLS = 5.0  # 秒
+# Gemini API のレート制限対策（APIキー3つのラウンドロビン運用: 実質45 RPM）
+WAIT_BETWEEN_CALLS = 2.0  # 秒
 
 
 def _build_prompt(company_name: str, industry: str, location: str, employees: str, business: str) -> str:

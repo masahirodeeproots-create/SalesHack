@@ -254,6 +254,26 @@ def extract_prtimes_fields(html: str) -> dict[str, str]:
     return fields
 
 
+def extract_kyujin_count(html: str) -> str | None:
+    """リクルートエージェント企業ページから公開求人数テキストを抽出。
+    例: '募集している求人16件' → '16件'。見つからなければ None。"""
+    import re
+    from bs4 import BeautifulSoup
+    soup = BeautifulSoup(html, "html.parser")
+    text = soup.get_text()
+    patterns = [
+        r'募集している求人(\d+)件',
+        r'公開求人数[^\d]*(\d+)\s*件',
+        r'公開中の求人[^\d]*(\d+)\s*件',
+        r'求人数[^\d]*(\d+)\s*件',
+    ]
+    for pattern in patterns:
+        m = re.search(pattern, text)
+        if m:
+            return m.group(1) + "件"
+    return None
+
+
 def extract_kyujin_urls(html: str) -> list[str]:
     """リクルートエージェント企業ページから求人URLを抽出"""
     soup = BeautifulSoup(html, "html.parser")
@@ -337,21 +357,30 @@ def extract_similar_search_fields(html: str) -> dict[str, str]:
 # みんかぶ（Minkabu）財務データ抽出
 # ---------------------------------------------------------------------------
 
-# 企業名 → 証券コードのマッピング（上場企業のみ）
-MINKABU_STOCK_CODES: dict[str, str] = {
-    "丸紅": "8002",
-    "岩谷産業": "8088",
-    "三井物産": "8031",
-    "三菱商事": "8058",
-    "三菱食品": "7451",
-    "住友商事": "8053",
-    "双日": "2768",
-    "アイフル": "8515",
-    "アコム": "8572",
-}
+def _load_stock_codes_from_db() -> dict[str, str]:
+    """
+    DB の companies テーブルから証券コード付き企業を取得する。
+    Returns: {name_normalized: stock_code}
+    DB が利用できない場合は空辞書を返す。
+    """
+    try:
+        from db.connection import get_session
+        from db.models import Company
+        with get_session() as session:
+            rows = session.query(Company.name_normalized, Company.stock_code).filter(
+                Company.stock_code.isnot(None),
+                Company.stock_code != "",
+            ).all()
+        result = {name: code for name, code in rows}
+        if result:
+            logger.info(f"証券コード: DB から {len(result)} 社取得")
+        return result
+    except Exception as e:
+        logger.debug(f"証券コードのDB取得スキップ: {e}")
+        return {}
 
 
-def _parse_minkabu_table(table, target_metrics: list[str]) -> dict[str, list[tuple[str, str]]]:
+def _parse_minkabu_table(table, target_metrics: list[str], max_periods: int = 3) -> dict[str, list[tuple[str, str]]]:
     """
     みんかぶのテーブルを解析して、指定メトリクスの値を期別に返す。
 
@@ -390,6 +419,8 @@ def _parse_minkabu_table(table, target_metrics: list[str]) -> dict[str, list[tup
         period = re.sub(r"\(.*?\)", "", period_text).strip()
 
         for metric, idx in metric_indices.items():
+            if len(result[metric]) >= max_periods:
+                continue  # 3期分取得済みならスキップ
             td_idx = idx - 1  # thが最初の列なのでtdインデックスは-1
             if 0 <= td_idx < len(tds):
                 val = tds[td_idx].get_text(strip=True)
@@ -629,10 +660,20 @@ def _run_pipeline(
             checkpoint[cp_key] = mapped
             save_checkpoint(checkpoint)
 
-            # リクルートエージェント: 求人情報の追加取得（最初の1件のみ）
+            # リクルートエージェント: 公開求人数を抽出 & 求人情報の追加取得（最初の1件のみ）
             if media_name == "リクルートエージェント":
+                # 公開求人数
+                kyujin_count = extract_kyujin_count(html)
+                if kyujin_count:
+                    mapped["リクルートエージェント公開求人数"] = kyujin_count
+                    print(f"    公開求人数: {kyujin_count}")
+
                 kyujin_urls = extract_kyujin_urls(html)
                 if kyujin_urls:
+                    # ページにカウントテキストがなければURL件数で補完
+                    if not kyujin_count:
+                        mapped["リクルートエージェント公開求人数"] = f"{len(kyujin_urls)}件"
+                        print(f"    公開求人数(URLカウント): {len(kyujin_urls)}件")
                     print(f"    求人URL: {len(kyujin_urls)}件 → 最初の1件を取得")
                     kyujin_html = fetch_html_scrapingdog(kyujin_urls[0])
                     time.sleep(REQUEST_INTERVAL)
@@ -656,9 +697,12 @@ def _run_pipeline(
     print("みんかぶ 財務データ収集")
     print("=" * 60)
 
+    # DB から証券コードを取得（company_importer.py でインポートされたデータを使用）
+    stock_codes = _load_stock_codes_from_db()
+
     minkabu_data: dict[str, dict[str, str]] = {}
     for company in company_media_urls.keys():
-        stock_code = MINKABU_STOCK_CODES.get(company)
+        stock_code = stock_codes.get(company)
         if not stock_code:
             continue
 

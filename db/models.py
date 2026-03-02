@@ -61,6 +61,7 @@ class Company(Base):
     name_normalized = Column(
         Text, unique=True, nullable=False, comment="名寄せ後の企業名"
     )
+    stock_code = Column(Text, nullable=True, comment="証券コード（上場企業のみ）例: 8031")
     created_at = Column(DateTime(timezone=True), default=_utcnow, nullable=False)
     updated_at = Column(
         DateTime(timezone=True), default=_utcnow, onupdate=_utcnow, nullable=False

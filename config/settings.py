@@ -60,6 +60,8 @@ DATABASE_URL = os.getenv("DATABASE_URL", "postgresql://localhost:5432/company_db
 # ---------------------------------------------------------------------------
 SCRAPINGDOG_API_KEY = _resolve_secret("SCRAPINGDOG_API_KEY", "scrapingdog-api-key")
 GEMINI_API_KEY = _resolve_secret("GEMINI_API_KEY", "gemini-api-key")
+GEMINI_API_KEY_2 = _resolve_secret("GEMINI_API_KEY_2", "gemini-api-key-2")
+GEMINI_API_KEY_3 = _resolve_secret("GEMINI_API_KEY_3", "gemini-api-key-3")
 
 # ---------------------------------------------------------------------------
 # HTTP共通定数

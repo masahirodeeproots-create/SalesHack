@@ -110,9 +110,18 @@ def _process_row(session, row: dict, source_name: str = "CSVインポート") ->
 
     # companies UPSERT
     company = session.query(Company).filter_by(name_normalized=company_name).first()
+    stock_code = row.get("証券コード", "").strip() or None
     if not company:
-        company = Company(name_raw=company_name, name_normalized=company_name)
+        company = Company(
+            name_raw=company_name,
+            name_normalized=company_name,
+            stock_code=stock_code,
+        )
         session.add(company)
+        session.flush()
+    elif stock_code and not company.stock_code:
+        # 既存企業に証券コードが未設定なら更新
+        company.stock_code = stock_code
         session.flush()
 
     # 各フィールドを処理
