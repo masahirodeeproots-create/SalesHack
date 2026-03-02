@@ -71,12 +71,22 @@ COLUMN_TO_CANONICAL: dict[str, str] = {
     "代表電話番号": "__phone__",   # 特別処理
 }
 
+import re
+
 # 文字列を正規化（企業名マッチング用）
 def _normalize_name(name: str) -> str:
     name = name.strip()
     for suffix in ["株式会社", "有限会社", "合同会社", "合資会社", "社団法人", "財団法人"]:
         name = name.replace(suffix, "").strip()
     return name
+
+
+def _clean_value(col: str, value: str) -> str:
+    """列ごとに値を正規化する。"""
+    if col == "本社都道府県":
+        # "09:栃木県" → "栃木県" のようなコード付きプレフィックスを除去
+        value = re.sub(r"^\d{2}:", "", value.strip())
+    return value.strip()
 
 
 # ---------------------------------------------------------------------------
@@ -126,7 +136,7 @@ def _process_row(session, row: dict, source_name: str = "CSVインポート") ->
 
     # 各フィールドを処理
     for csv_col, canonical in COLUMN_TO_CANONICAL.items():
-        value = row.get(csv_col, "").strip()
+        value = _clean_value(csv_col, row.get(csv_col, ""))
         if not value:
             continue
 
