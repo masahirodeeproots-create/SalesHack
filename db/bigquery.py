@@ -90,30 +90,21 @@ _HR_SERVICE_USAGES_SCHEMA = [
 ]
 
 
-def truncate_hr_service_usages() -> None:
+def upload_hr_service_usages_safe(rows: list[dict], min_ratio: float = 0.9) -> None:
     """
-    hr_service_usages テーブルを空にする。
-    run_all.py の開始時に呼び出し、14サービスの WRITE_APPEND が重複しないようにする。
-    テーブルが存在しない場合は何もしない。
-    """
-    client = _get_client()
-    table_id = f"{GCP_PROJECT_ID}.{BQ_DATASET}.hr_service_usages"
-    try:
-        client.get_table(table_id)
-    except Exception:
-        return  # テーブルがなければスキップ
+    HR サービス利用状況データを BigQuery に安全に差し替える。
 
-    client.query(f"TRUNCATE TABLE `{table_id}`").result()
-    logger.info(f"BigQuery (hr_service_usages) truncate 完了: {table_id}")
+    新データ件数が旧データ件数の min_ratio（デフォルト 90%）以上の場合のみ
+    WRITE_TRUNCATE で全件置換する。それ以下の場合は書き込みをスキップし警告を出す。
+    これにより、ページ構造変更等でスクレイパーが大幅に件数を下回った場合に
+    旧データが誤って消去されるのを防ぐ。
 
-
-def upload_hr_service_usages(rows: list[dict]) -> None:
-    """
-    HR サービス利用状況データを BigQuery に追記する（WRITE_APPEND）。
-    run_all.py 開始時に truncate_hr_service_usages() を呼び出してからこの関数を使う。
+    テーブルが存在しない（初回実行）場合は件数チェックをスキップして書き込む。
 
     Args:
-        rows: [{"企業名": str, "サービス名": str, "タイトル": str, "掲載日": str, "カテゴリ": str}, ...]
+        rows:      [{"企業名": str, "サービス名": str, "タイトル": str,
+                     "掲載日": str, "カテゴリ": str}, ...]
+        min_ratio: 新データ / 旧データ の下限比率（デフォルト 0.9 = 90%）
     """
     if not rows:
         logger.warning("BigQuery (hr_service_usages): アップロード対象のデータがありません")
@@ -121,6 +112,25 @@ def upload_hr_service_usages(rows: list[dict]) -> None:
 
     client = _get_client()
     table_id = f"{GCP_PROJECT_ID}.{BQ_DATASET}.hr_service_usages"
+
+    # 現在の件数を取得（テーブルがなければ 0 = 初回扱い）
+    current_count = 0
+    try:
+        current_count = client.get_table(table_id).num_rows
+    except Exception:
+        pass
+
+    new_count = len(rows)
+
+    # 件数チェック：旧データが存在し、新データが閾値を下回る場合はスキップ
+    if current_count > 0 and new_count < current_count * min_ratio:
+        logger.warning(
+            f"BigQuery (hr_service_usages) 書き込みスキップ: "
+            f"新データ {new_count}件 が旧データ {current_count}件 の "
+            f"{min_ratio:.0%} を下回っています。"
+            f"ページ構造変更またはスクレイピング失敗の可能性があります。"
+        )
+        return
 
     table = bigquery.Table(table_id, schema=_HR_SERVICE_USAGES_SCHEMA)
     client.create_table(table, exists_ok=True)
@@ -130,13 +140,16 @@ def upload_hr_service_usages(rows: list[dict]) -> None:
 
     job_config = bigquery.LoadJobConfig(
         schema=_HR_SERVICE_USAGES_SCHEMA,
-        write_disposition=bigquery.WriteDisposition.WRITE_APPEND,
+        write_disposition=bigquery.WriteDisposition.WRITE_TRUNCATE,
     )
     job = client.load_table_from_json(bq_rows, table_id, job_config=job_config)
     job.result()
 
-    logger.info(f"BigQuery (hr_service_usages) アップロード完了: {len(bq_rows)}行")
-    print(f"BigQuery アップロード完了: {len(bq_rows)}行 → {table_id}")
+    logger.info(
+        f"BigQuery (hr_service_usages) 更新完了: "
+        f"{current_count}件 → {new_count}件 ({table_id})"
+    )
+    print(f"BigQuery アップロード完了: {new_count}行 → {table_id}")
 
 
 def upload_contacts(rows: list[dict]) -> None:

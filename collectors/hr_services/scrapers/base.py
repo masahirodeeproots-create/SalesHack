@@ -63,8 +63,6 @@ class BaseScraper(ABC):
                     f"途中結果を保存: {len(self.results)}件"
                 )
 
-        if os.getenv("UPLOAD_TO_BIGQUERY", "").lower() == "true":
-            self.save_to_bigquery()
 
     def save_raw_csv(self):
         """求人単位rawデータをBOM付きUTF-8のCSVに保存"""
@@ -139,18 +137,13 @@ class BaseScraper(ABC):
         self.logger.info(f"既存結果ロード: {len(rows)}件")
         return rows
 
-    def save_to_bigquery(self) -> None:
-        """スクレイピング結果を BigQuery にアップロードする。"""
-        if not self.results:
-            self.logger.warning(f"BigQuery アップロードスキップ: データなし ({self.service_name})")
-            return
-
-        # サービスのカテゴリを SERVICE_REGISTRY から取得
+    def get_bq_rows(self) -> list[dict]:
+        """スクレイピング結果を BigQuery 用の行リストに変換して返す。"""
         service_cfg = SERVICE_REGISTRY.get(self.service_name, {})
         category = service_cfg.get("category", "")
         service_display_name = service_cfg.get("name", self.service_name)
 
-        bq_rows = [
+        return [
             {
                 "企業名": row.get("企業名", ""),
                 "サービス名": service_display_name,
@@ -160,13 +153,3 @@ class BaseScraper(ABC):
             }
             for row in self.results
         ]
-
-        try:
-            # プロジェクトルートを sys.path に追加して db.bigquery を import
-            _project_root = str(Path(__file__).resolve().parent.parent.parent.parent)
-            if _project_root not in sys.path:
-                sys.path.insert(0, _project_root)
-            from db.bigquery import upload_hr_service_usages
-            upload_hr_service_usages(bq_rows)
-        except Exception as e:
-            self.logger.error(f"BigQuery アップロード失敗 ({self.service_name}): {e}")

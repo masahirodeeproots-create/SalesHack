@@ -59,18 +59,7 @@ def run_scrapers(targets: list[str] | None = None):
     """指定されたスクレイパーを順次実行する"""
     keys = targets or list(SCRAPER_MAP.keys())
     results = {"success": [], "failed": [], "skipped": []}
-
-    # BQ有効時: 各サービスが WRITE_APPEND で追記するため、開始前にテーブルを空にする
-    if os.getenv("UPLOAD_TO_BIGQUERY", "").lower() == "true":
-        _project_root = str(Path(__file__).resolve().parent.parent.parent)
-        if _project_root not in sys.path:
-            sys.path.insert(0, _project_root)
-        try:
-            from db.bigquery import truncate_hr_service_usages
-            truncate_hr_service_usages()
-            logger.info("BigQuery hr_service_usages テーブルをリセットしました")
-        except Exception as e:
-            logger.warning(f"BigQuery truncate スキップ（テーブル未作成等）: {e}")
+    all_bq_rows: list[dict] = []
 
     for key in keys:
         if key not in SCRAPER_MAP:
@@ -96,9 +85,21 @@ def run_scrapers(targets: list[str] | None = None):
             scraper = ScraperClass()
             scraper.run()
             results["success"].append(key)
+            all_bq_rows.extend(scraper.get_bq_rows())
         except Exception as e:
             logger.error(f"{key} 実行エラー: {e}", exc_info=True)
             results["failed"].append(key)
+
+    # BQ有効時: 全スクレイパー完了後に件数チェックしてから一括差し替え
+    if os.getenv("UPLOAD_TO_BIGQUERY", "").lower() == "true":
+        _project_root = str(Path(__file__).resolve().parent.parent.parent)
+        if _project_root not in sys.path:
+            sys.path.insert(0, _project_root)
+        try:
+            from db.bigquery import upload_hr_service_usages_safe
+            upload_hr_service_usages_safe(all_bq_rows, min_ratio=0.9)
+        except Exception as e:
+            logger.error(f"BigQuery アップロード失敗: {e}", exc_info=True)
 
     return results
 
