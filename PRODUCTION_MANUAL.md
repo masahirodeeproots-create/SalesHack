@@ -46,11 +46,8 @@ PSQL="/opt/homebrew/Cellar/postgresql@15/15.15_1/bin/psql"
 $PSQL postgres -c "DROP DATABASE IF EXISTS company_db;"
 $PSQL postgres -c "CREATE DATABASE company_db;"
 
-# テーブル・シードデータ投入
-venv/bin/python -m db.seed
-
-# ビュー作成
-$PSQL company_db -f db/views.sql
+# テーブル作成（rawdata テーブル含む）
+venv/bin/python -c "from db.connection import init_db; init_db()"
 
 echo "PostgreSQL リセット完了"
 ```
@@ -184,9 +181,7 @@ venv/bin/python -m collectors.gemini_enrichment.sync --limit 100
 **確認:**
 ```bash
 /opt/homebrew/Cellar/postgresql@15/15.15_1/bin/psql company_db \
-  -c "SELECT COUNT(*) FROM company_field_values v
-      JOIN field_definitions fd ON v.field_id = fd.id
-      WHERE fd.canonical_name LIKE '類似企業%';"
+  -c "SELECT COUNT(*) FROM rawdata_competitors;"
 ```
 
 ---
@@ -300,6 +295,6 @@ bq show --format=prettyjson company-data-collector:company_data.en_hyouban_revie
 |---|---|
 | `GEMINI_API_KEY が設定されていません` | `.env` を確認。`source venv/bin/activate` 後に再実行 |
 | ScrapingDog エラー多発 | APIクレジット残量確認。`SCRAPINGDOG_API_KEY` 確認 |
-| `field_definitions 未登録` | `venv/bin/python -m db.seed` を再実行 |
+| rawdata テーブルが存在しない | `venv/bin/python -c "from db.connection import init_db; init_db()"` を実行 |
 | BQ 認証エラー | `gcloud auth application-default login` を実行 |
 | PostgreSQL 接続エラー | PostgreSQL が起動しているか確認: `brew services start postgresql@15` |

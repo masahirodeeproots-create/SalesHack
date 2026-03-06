@@ -4,11 +4,11 @@ analytics/csv_exporter.py
 DBの各テーブルをCSVにエクスポートする。
 
 エクスポート対象:
-  - companies_export.csv     : 企業マスタ＋フィールド値（横展開）
-  - phone_numbers_export.csv : 電話番号一覧
-  - persons_export.csv       : 担当者一覧
-  - call_logs_export.csv     : 架電ログ一覧
-  - deals_export.csv         : 商談一覧
+  - companies_export.csv     : 企業マスタ＋rawdata基本情報＋エン評判
+  - phone_numbers_export.csv : 電話番号一覧（営業管理テーブル）
+  - persons_export.csv       : 担当者一覧（営業管理テーブル）
+  - call_logs_export.csv     : 架電ログ一覧（営業管理テーブル）
+  - deals_export.csv         : 商談一覧（営業管理テーブル）
 
 使い方:
   # 全テーブルをエクスポート
@@ -37,12 +37,12 @@ from db.connection import get_session
 from db.models import (
     CallLog,
     Company,
-    CompanyFieldValue,
     CompanyPerson,
     Deal,
-    FieldDefinition,
     PhoneNumber,
     Product,
+    RawdataCompanyInfo,
+    RawdataEnHyouban,
     SalesRep,
 )
 
@@ -57,40 +57,91 @@ DEFAULT_EXPORT_DIR = OUTPUT_DIR / "exports"
 
 def export_companies(session, output_path: Path) -> int:
     """
-    企業マスタ＋フィールド値を横展開してCSVに出力する。
-    フィールドが増えても自動で列が増える。
+    企業マスタ＋rawdata_company_info＋rawdata_en_hyouban を横展開してCSVに出力する。
+    各rawdataテーブルから original_id ごとに最新1件を取得する。
     """
-    # 全フィールド定義を取得（表示順）
-    fields: list[FieldDefinition] = (
-        session.query(FieldDefinition)
-        .order_by(FieldDefinition.display_order, FieldDefinition.id)
+    from sqlalchemy import func
+
+    companies: list[Company] = session.query(Company).order_by(Company.name_normalized).all()
+
+    # rawdata_company_info: original_id ごとに最新1件
+    ci_subq = (
+        session.query(
+            RawdataCompanyInfo.original_id,
+            func.max(RawdataCompanyInfo.scraped_at).label("max_scraped"),
+        )
+        .group_by(RawdataCompanyInfo.original_id)
+        .subquery()
+    )
+    ci_rows = (
+        session.query(RawdataCompanyInfo)
+        .join(ci_subq, (RawdataCompanyInfo.original_id == ci_subq.c.original_id)
+              & (RawdataCompanyInfo.scraped_at == ci_subq.c.max_scraped))
         .all()
     )
-    field_names = [f.canonical_name for f in fields]
-    field_id_to_name = {f.id: f.canonical_name for f in fields}
+    ci_map = {r.original_id: r for r in ci_rows}
 
-    # 企業ごとにフィールド値を収集
-    companies: list[Company] = session.query(Company).order_by(Company.name_normalized).all()
+    # rawdata_en_hyouban: original_id ごとに最新1件
+    eh_subq = (
+        session.query(
+            RawdataEnHyouban.original_id,
+            func.max(RawdataEnHyouban.scraped_at).label("max_scraped"),
+        )
+        .group_by(RawdataEnHyouban.original_id)
+        .subquery()
+    )
+    eh_rows = (
+        session.query(RawdataEnHyouban)
+        .join(eh_subq, (RawdataEnHyouban.original_id == eh_subq.c.original_id)
+              & (RawdataEnHyouban.scraped_at == eh_subq.c.max_scraped))
+        .all()
+    )
+    eh_map = {r.original_id: r for r in eh_rows}
+
+    columns = [
+        "company_id", "企業名", "証券コード",
+        "本社都道府県", "代表者名", "従業員数", "企業規模", "業種", "業種詳細", "代表電話番号",
+        "en_total_score", "en_review_count", "en_avg_salary", "en_avg_age",
+        "en_score_growth", "en_score_advantage", "en_score_meritocracy", "en_score_culture",
+        "en_score_youth", "en_score_contribution", "en_score_innovation", "en_score_leadership",
+        "en_reviews_text",
+        "登録日時",
+    ]
 
     rows = []
     for company in companies:
+        cid = str(company.id)
+        ci = ci_map.get(cid)
+        eh = eh_map.get(cid)
+
         row = {
-            "company_id": str(company.id),
+            "company_id": cid,
             "企業名": company.name_normalized,
+            "証券コード": company.stock_code or "",
+            "本社都道府県": getattr(ci, "本社都道府県", "") or "" if ci else "",
+            "代表者名": getattr(ci, "代表者名", "") or "" if ci else "",
+            "従業員数": getattr(ci, "従業員数", "") or "" if ci else "",
+            "企業規模": getattr(ci, "企業規模", "") or "" if ci else "",
+            "業種": getattr(ci, "業種", "") or "" if ci else "",
+            "業種詳細": getattr(ci, "業種詳細", "") or "" if ci else "",
+            "代表電話番号": getattr(ci, "代表電話番号", "") or "" if ci else "",
+            "en_total_score": getattr(eh, "total_score", "") or "" if eh else "",
+            "en_review_count": getattr(eh, "review_count", "") or "" if eh else "",
+            "en_avg_salary": getattr(eh, "avg_salary", "") or "" if eh else "",
+            "en_avg_age": getattr(eh, "avg_age", "") or "" if eh else "",
+            "en_score_growth": getattr(eh, "score_growth", "") or "" if eh else "",
+            "en_score_advantage": getattr(eh, "score_advantage", "") or "" if eh else "",
+            "en_score_meritocracy": getattr(eh, "score_meritocracy", "") or "" if eh else "",
+            "en_score_culture": getattr(eh, "score_culture", "") or "" if eh else "",
+            "en_score_youth": getattr(eh, "score_youth", "") or "" if eh else "",
+            "en_score_contribution": getattr(eh, "score_contribution", "") or "" if eh else "",
+            "en_score_innovation": getattr(eh, "score_innovation", "") or "" if eh else "",
+            "en_score_leadership": getattr(eh, "score_leadership", "") or "" if eh else "",
+            "en_reviews_text": getattr(eh, "reviews_text", "") or "" if eh else "",
             "登録日時": company.created_at.strftime("%Y-%m-%d %H:%M") if company.created_at else "",
         }
-        # フィールド値を dict で収集
-        fv_map: dict[str, str] = {}
-        for cfv in company.field_values:
-            fname = field_id_to_name.get(cfv.field_id)
-            if fname:
-                fv_map[fname] = cfv.value
-
-        for fname in field_names:
-            row[fname] = fv_map.get(fname, "")
         rows.append(row)
 
-    columns = ["company_id", "企業名", "登録日時"] + field_names
     _write_csv(output_path, columns, rows)
     return len(rows)
 

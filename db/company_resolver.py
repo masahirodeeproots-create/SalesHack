@@ -12,32 +12,76 @@
 DB接続できない場合は全て None を返す（BQ upload はスキップしない）。
 """
 
-_LEGAL_SUFFIXES = [
-    "株式会社", "有限会社", "合同会社", "合資会社", "社団法人", "財団法人",
-    "（株）", "(株)", "（有）", "(有)", "（合）", "(合)",
-]
+import re
+import unicodedata
 
-_ZEN_TO_HAN = str.maketrans(
-    "ａｂｃｄｅｆｇｈｉｊｋｌｍｎｏｐｑｒｓｔｕｖｗｘｙｚ"
-    "ＡＢＣＤＥＦＧＨＩＪＫＬＭＮＯＰＱＲＳＴＵＶＷＸＹＺ"
-    "　",
-    "abcdefghijklmnopqrstuvwxyz"
-    "ABCDEFGHIJKLMNOPQRSTUVWXYZ"
-    " ",
-)
+# 除去する法人格パターン（包括的リスト）
+_LEGAL_ENTITIES = [
+    r"株式会社",
+    r"\(株\)",
+    r"（株）",
+    r"㈱",
+    r"有限会社",
+    r"\(有\)",
+    r"（有）",
+    r"合同会社",
+    r"\(同\)",
+    r"（同）",
+    r"合名会社",
+    r"合資会社",
+    r"一般社団法人",
+    r"一般財団法人",
+    r"公益社団法人",
+    r"公益財団法人",
+    r"医療法人",
+    r"社会福祉法人",
+    r"学校法人",
+    r"宗教法人",
+    r"NPO法人",
+    r"特定非営利活動法人",
+    r"独立行政法人",
+    r"社団法人",
+    r"財団法人",
+]
+_LEGAL_PATTERN = re.compile("|".join(_LEGAL_ENTITIES))
+
+# 先頭・末尾の括弧注釈パターン（例: (東京), [上場], 【東証プライム上場WDBグループ】）
+_LEADING_ANNOTATION = re.compile(r"^[（(\[【][^）)\]】]*[）)\]】]\s*")
+_TRAILING_ANNOTATION = re.compile(r"\s*[（(\[【][^）)\]】]*[）)\]】]\s*$")
 
 
 def normalize_company_name(name: str) -> str:
     """
-    企業名を正規化する（hr_services のスクレイプ名との突合用）。
-    - 全角英数・スペースを半角に変換
-    - 法人格（株式会社、有限会社等）を除去
-    - 前後の空白を除去
+    企業名を正規化する（企業マスターとの突合用）。
+
+    1. Unicode NFKC正規化（全角英数字→半角、合字分解等）
+    2. 法人格除去（株式会社, (株), ㈱, 有限会社 等）
+    3. 空白正規化（全角スペース含む）
+    4. 引用符・括弧の除去
+    5. 末尾注釈の除去（例: (東京), [上場], 【東証プライム上場WDBグループ】）
     """
-    name = name.translate(_ZEN_TO_HAN).strip()
-    for suffix in _LEGAL_SUFFIXES:
-        name = name.replace(suffix, "")
-    return name.strip()
+    if not name:
+        return ""
+
+    name = name.strip()
+
+    # 1. NFKC正規化（全角→半角: Ａ→A, ０→0, ＆→& 等）
+    name = unicodedata.normalize("NFKC", name)
+
+    # 2. 法人格除去
+    name = _LEGAL_PATTERN.sub("", name)
+
+    # 3. 空白正規化
+    name = re.sub(r"[\s\u3000]+", " ", name).strip()
+
+    # 4. 先頭・末尾の括弧注釈除去（例: 【東証プライム上場】, (東京), [上場]）
+    name = _LEADING_ANNOTATION.sub("", name)
+    name = _TRAILING_ANNOTATION.sub("", name).strip()
+
+    # 5. 残った引用符・括弧除去
+    name = name.strip("\"'「」『』【】")
+
+    return name
 
 
 def resolve_company_ids(names: list[str]) -> dict[str, str | None]:

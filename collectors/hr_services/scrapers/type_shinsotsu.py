@@ -13,15 +13,12 @@ class Scraper(BaseScraper):
 
     def scrape(self) -> list[dict]:
         page = 1
+        prev_names: set[str] = set()
         while True:
-            self.logger.info(f"Page {page}: POST送信")
+            url = f"{self.BASE_URL}?page={page}"
+            self.logger.info(f"Page {page}: {url}")
 
-            # type就活はform POSTでページネーション
-            if page == 1:
-                html = self.client.fetch_requests(self.BASE_URL)
-            else:
-                html = self._fetch_page_post(page)
-
+            html = self.client.fetch_requests(url)
             if html is None:
                 self.logger.warning(f"Page {page}: HTML取得失敗")
                 break
@@ -31,6 +28,13 @@ class Scraper(BaseScraper):
                 self.logger.info(f"Page {page}: 結果なし → 終了")
                 break
 
+            # 同一結果ループ検出（終端ページ以降は同じ結果が返る）
+            current_names = {c["企業名"] for c in companies}
+            if current_names == prev_names:
+                self.logger.info(f"Page {page}: 前ページと同一 → 終了")
+                break
+            prev_names = current_names
+
             self.results.extend(companies)
             self.logger.info(
                 f"Page {page}: {len(companies)}社取得（累計: {len(self.results)}社）"
@@ -39,24 +43,6 @@ class Scraper(BaseScraper):
             self.client.sleep()
 
         return self.results
-
-    def _fetch_page_post(self, page: int) -> str | None:
-        """POSTリクエストで指定ページを取得"""
-        import requests as req
-
-        try:
-            response = req.post(
-                self.BASE_URL,
-                data={"page": page},
-                headers={"User-Agent": self.client._session.headers["User-Agent"]},
-                timeout=20,
-            )
-            response.raise_for_status()
-            response.encoding = response.apparent_encoding
-            return response.text
-        except Exception as e:
-            self.logger.error(f"POST失敗 (page={page}): {e}")
-            return None
 
     def _parse_page(self, html: str) -> list[dict]:
         """HTML解析で企業情報を抽出"""

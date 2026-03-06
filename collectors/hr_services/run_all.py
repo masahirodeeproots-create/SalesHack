@@ -1,6 +1,5 @@
-"""全スクレイパー実行 → マスターDB構築のオーケストレーター"""
+"""全スクレイパー実行 → rawdata_hr_* テーブルに書き込むオーケストレーター"""
 
-import os
 import sys
 import logging
 import argparse
@@ -27,20 +26,38 @@ logger = logging.getLogger(__name__)
 
 # スクレイパーモジュールのインポートマップ
 SCRAPER_MAP = {
-    "labbase": "scrapers.labbase",
-    "talentbook": "scrapers.talentbook",
-    "type_shinsotsu": "scrapers.type_shinsotsu",
-    "onecareer": "scrapers.onecareer",
-    "levtech_rookie": "scrapers.levtech_rookie",
+    "labbase":         "scrapers.labbase",
+    "talentbook":      "scrapers.talentbook",
+    "type_shinsotsu":  "scrapers.type_shinsotsu",
+    "onecareer":       "scrapers.onecareer",
+    "levtech_rookie":  "scrapers.levtech_rookie",
     "bizreach_campus": "scrapers.bizreach_campus",
-    "offerbox": "scrapers.offerbox",
-    "en_tenshoku": "scrapers.en_tenshoku",
-    "kimisuka": "scrapers.kimisuka",
-    "caritasu": "scrapers.caritasu",
-    "career_ticket": "scrapers.career_ticket",
-    "bizreach": "scrapers.bizreach",
-    "en_ambi": "scrapers.en_ambi",
-    "type_chuto": "scrapers.type_chuto",
+    "offerbox":        "scrapers.offerbox",
+    "en_tenshoku":     "scrapers.en_tenshoku",
+    "kimisuka":        "scrapers.kimisuka",
+    "caritasu":        "scrapers.caritasu",
+    "career_ticket":   "scrapers.career_ticket",
+    "bizreach":        "scrapers.bizreach",
+    "en_ambi":         "scrapers.en_ambi",
+    "type_chuto":      "scrapers.type_chuto",
+}
+
+# サービスキー → rawdata モデルクラス名 のマッピング
+_RAWDATA_MODEL_MAP = {
+    "labbase":         "RawdataHrLabbase",
+    "talentbook":      "RawdataHrTalentbook",
+    "type_shinsotsu":  "RawdataHrTypeShinsotsu",
+    "onecareer":       "RawdataHrOnecareer",
+    "levtech_rookie":  "RawdataHrLevtechRookie",
+    "bizreach_campus": "RawdataHrBizreachCampus",
+    "offerbox":        "RawdataHrOfferbox",
+    "en_tenshoku":     "RawdataHrEnTenshoku",
+    "kimisuka":        "RawdataHrKimisuka",
+    "caritasu":        "RawdataHrCaritasu",
+    "career_ticket":   "RawdataHrCareerTicket",
+    "bizreach":        "RawdataHrBizreach",
+    "en_ambi":         "RawdataHrEnAmbi",
+    "type_chuto":      "RawdataHrTypeChuto",
 }
 
 
@@ -55,11 +72,57 @@ def import_scraper(key: str):
         return None
 
 
+def _save_to_rawdata(key: str, rows: list[dict]) -> int:
+    """
+    スクレイパー結果を rawdata_hr_* テーブルに書き込む。
+    original_id は null（中間1でのマッチング後に付与）。
+    Returns: 書き込み件数
+    """
+    if not rows:
+        return 0
+
+    _project_root = str(Path(__file__).resolve().parent.parent.parent)
+    if _project_root not in sys.path:
+        sys.path.insert(0, _project_root)
+    # ローカル config.py がキャッシュされている場合は除去
+    sys.modules.pop("config", None)
+
+    model_name = _RAWDATA_MODEL_MAP.get(key)
+    if not model_name:
+        logger.warning(f"{key}: rawdata モデルが未定義")
+        return 0
+
+    try:
+        import db.models as _models
+        from db.connection import get_session
+        ModelClass = getattr(_models, model_name)
+    except (ImportError, AttributeError) as e:
+        logger.error(f"{key}: rawdata モデルのインポート失敗 ({e})")
+        return 0
+
+    written = 0
+    try:
+        with get_session() as session:
+            for row in rows:
+                record = ModelClass(
+                    original_id=None,  # 中間1で付与
+                    source_url=row.get("url") or row.get("source_url") or None,
+                    企業名_掲載名=row.get("企業名") or None,
+                    掲載日=row.get("掲載日") or None,
+                )
+                session.add(record)
+                written += 1
+        logger.info(f"  {key}: rawdata {written}件書き込み完了")
+    except Exception as e:
+        logger.error(f"  {key}: rawdata書き込みエラー: {e}", exc_info=True)
+
+    return written
+
+
 def run_scrapers(targets: list[str] | None = None):
     """指定されたスクレイパーを順次実行する"""
     keys = targets or list(SCRAPER_MAP.keys())
     results = {"success": [], "failed": [], "skipped": []}
-    all_bq_rows: list[dict] = []
 
     for key in keys:
         if key not in SCRAPER_MAP:
@@ -84,28 +147,12 @@ def run_scrapers(targets: list[str] | None = None):
         try:
             scraper = ScraperClass()
             scraper.run()
+            bq_rows = scraper.get_bq_rows()
+            _save_to_rawdata(key, bq_rows)
             results["success"].append(key)
-            all_bq_rows.extend(scraper.get_bq_rows())
         except Exception as e:
             logger.error(f"{key} 実行エラー: {e}", exc_info=True)
             results["failed"].append(key)
-
-    # BQ有効時: 全スクレイパー完了後に件数チェックしてから一括差し替え
-    if os.getenv("UPLOAD_TO_BIGQUERY", "").lower() == "true":
-        _project_root = str(Path(__file__).resolve().parent.parent.parent)
-        if _project_root not in sys.path:
-            sys.path.insert(0, _project_root)
-        try:
-            from db.bigquery import upload_hr_service_usages_safe
-            from db.company_resolver import resolve_company_ids
-            # スクレイプ企業名 → PostgreSQL company_id を解決して付与
-            company_names = list({row["企業名"] for row in all_bq_rows if row.get("企業名")})
-            company_id_map = resolve_company_ids(company_names)
-            for row in all_bq_rows:
-                row["company_id"] = company_id_map.get(row.get("企業名"))
-            upload_hr_service_usages_safe(all_bq_rows, min_ratio=0.9)
-        except Exception as e:
-            logger.error(f"BigQuery アップロード失敗: {e}", exc_info=True)
 
     return results
 
@@ -145,7 +192,6 @@ def main():
         targets = args.services if args.services else None
         results = run_scrapers(targets)
 
-        # サマリー表示
         print("\n" + "=" * 50)
         print("スクレイピング結果サマリー")
         print(f"  成功: {len(results['success'])}件 {results['success']}")

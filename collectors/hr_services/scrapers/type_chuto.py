@@ -83,10 +83,20 @@ class Scraper(BaseScraper):
                 if title_el:
                     title = title_el.get_text(strip=True)
 
+            # 掲載終了予定日: p.end-date → "掲載終了予定日：2026.03.30" or "掲載終了予定日：2026.03.09残り4日"
+            posting_date = ""
+            if card:
+                end_date_el = card.select_one("p.end-date")
+                if end_date_el:
+                    end_text = end_date_el.get_text(strip=True)
+                    date_match = re.search(r"(\d{4})\.(\d{2})\.(\d{2})", end_text)
+                    if date_match:
+                        posting_date = f"{date_match.group(1)}-{date_match.group(2)}-{date_match.group(3)}"
+
             items.append({
                 "企業名": company_name,
                 "タイトル": title,
-                "掲載日": "",
+                "掲載日": posting_date,
             })
 
         return items

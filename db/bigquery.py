@@ -1,325 +1,189 @@
 """
 BigQuery 書き込みヘルパー
 ========================
-collect_company_data のパイプライン結果を BigQuery に投入する。
-テーブルが存在しない場合は自動作成する。
+設計書の中間データ2に対応する BQ テーブルへアップロードする。
+
+ポリシー:
+- 企業マスターのみ WRITE_TRUNCATE（常に最新全社分で上書き）
+- その他全テーブルは WRITE_APPEND（行を追加・累積保存）
+- 入力は pandas DataFrame
 """
 
 import logging
-from datetime import datetime, timezone
 
+import pandas as pd
 from google.cloud import bigquery
 
-from config.settings import GCP_PROJECT_ID, BQ_DATASET, BQ_TABLE
+from config.settings import GCP_PROJECT_ID, BQ_DATASET
 
 logger = logging.getLogger(__name__)
 
 
-def _get_client() -> bigquery.Client:
+def _client() -> bigquery.Client:
     return bigquery.Client(project=GCP_PROJECT_ID)
 
 
-def _build_table_id() -> str:
-    return f"{GCP_PROJECT_ID}.{BQ_DATASET}.{BQ_TABLE}"
+def _table_id(table_name: str) -> str:
+    return f"{GCP_PROJECT_ID}.{BQ_DATASET}.{table_name}"
 
 
-def upload_company_data(
-    final_data: dict[str, dict[str, str]],
-    sorted_canonicals: list[str],
-    company_order: list[str],
-    company_id_map: dict[str, str | None] | None = None,
+def _upload(
+    df: pd.DataFrame,
+    table_name: str,
+    write_disposition: bigquery.WriteDisposition,
 ) -> None:
-    """
-    企業データを BigQuery にアップロードする。
-    既存データは全件置換（WRITE_TRUNCATE）。
-
-    Args:
-        final_data:        {企業名: {canonical: value}} の辞書
-        sorted_canonicals: 出力するフィールド名の順序付きリスト
-        company_order:     企業の出力順
-        company_id_map:    {企業名: company_id (UUID文字列 or None)} の辞書（省略可）
-    """
-    client = _get_client()
-    table_id = _build_table_id()
-
-    # スキーマ定義（全フィールドを STRING として格納）
-    schema = [
-        bigquery.SchemaField("企業名", "STRING", mode="REQUIRED"),
-        bigquery.SchemaField("company_id", "STRING", mode="NULLABLE"),
-    ]
-    for canonical in sorted_canonicals:
-        schema.append(bigquery.SchemaField(canonical, "STRING", mode="NULLABLE"))
-    schema.append(
-        bigquery.SchemaField("updated_at", "TIMESTAMP", mode="REQUIRED")
-    )
-
-    # テーブルが存在しなければ作成
-    table = bigquery.Table(table_id, schema=schema)
-    table = client.create_table(table, exists_ok=True)
-    logger.info(f"BigQuery テーブル準備完了: {table_id}")
-
-    # 行データを構築
-    now = datetime.now(timezone.utc).isoformat()
-    rows = []
-    for company in company_order:
-        row = {
-            "企業名": company,
-            "company_id": company_id_map.get(company) if company_id_map else None,
-            "updated_at": now,
-        }
-        for canonical in sorted_canonicals:
-            row[canonical] = final_data.get(company, {}).get(canonical, "")
-        rows.append(row)
-
-    if not rows:
-        logger.warning("BigQuery: アップロード対象のデータがありません")
+    """DataFrame を BQ テーブルにアップロードする共通処理。"""
+    if df.empty:
+        logger.warning(f"BigQuery ({table_name}): アップロード対象データなし")
         return
 
-    # アップロード（全件置換）
-    job_config = bigquery.LoadJobConfig(
-        schema=schema,
-        write_disposition=bigquery.WriteDisposition.WRITE_TRUNCATE,
-    )
-    job = client.load_table_from_json(rows, table_id, job_config=job_config)
-    job.result()  # 完了を待つ
-
-    logger.info(f"BigQuery アップロード完了: {len(rows)}行")
-    print(f"BigQuery アップロード完了: {len(rows)}行 → {table_id}")
-
-
-_HR_SERVICE_USAGES_SCHEMA = [
-    bigquery.SchemaField("企業名", "STRING", mode="REQUIRED"),
-    bigquery.SchemaField("company_id", "STRING", mode="NULLABLE"),
-    bigquery.SchemaField("サービス名", "STRING", mode="NULLABLE"),
-    bigquery.SchemaField("タイトル", "STRING", mode="NULLABLE"),
-    bigquery.SchemaField("掲載日", "STRING", mode="NULLABLE"),
-    bigquery.SchemaField("カテゴリ", "STRING", mode="NULLABLE"),
-    bigquery.SchemaField("updated_at", "TIMESTAMP", mode="REQUIRED"),
-]
-
-
-def upload_hr_service_usages_safe(rows: list[dict], min_ratio: float = 0.9) -> None:
-    """
-    HR サービス利用状況データを BigQuery に安全に差し替える。
-
-    新データ件数が旧データ件数の min_ratio（デフォルト 90%）以上の場合のみ
-    WRITE_TRUNCATE で全件置換する。それ以下の場合は書き込みをスキップし警告を出す。
-    これにより、ページ構造変更等でスクレイパーが大幅に件数を下回った場合に
-    旧データが誤って消去されるのを防ぐ。
-
-    テーブルが存在しない（初回実行）場合は件数チェックをスキップして書き込む。
-
-    Args:
-        rows:      [{"企業名": str, "サービス名": str, "タイトル": str,
-                     "掲載日": str, "カテゴリ": str}, ...]
-        min_ratio: 新データ / 旧データ の下限比率（デフォルト 0.9 = 90%）
-    """
-    if not rows:
-        logger.warning("BigQuery (hr_service_usages): アップロード対象のデータがありません")
-        return
-
-    client = _get_client()
-    table_id = f"{GCP_PROJECT_ID}.{BQ_DATASET}.hr_service_usages"
-
-    # 現在の件数を取得（テーブルがなければ 0 = 初回扱い）
-    current_count = 0
-    try:
-        current_count = client.get_table(table_id).num_rows
-    except Exception:
-        pass
-
-    new_count = len(rows)
-
-    # 件数チェック：旧データが存在し、新データが閾値を下回る場合はスキップ
-    if current_count > 0 and new_count < current_count * min_ratio:
-        logger.warning(
-            f"BigQuery (hr_service_usages) 書き込みスキップ: "
-            f"新データ {new_count}件 が旧データ {current_count}件 の "
-            f"{min_ratio:.0%} を下回っています。"
-            f"ページ構造変更またはスクレイピング失敗の可能性があります。"
-        )
-        return
-
-    table = bigquery.Table(table_id, schema=_HR_SERVICE_USAGES_SCHEMA)
-    client.create_table(table, exists_ok=True)
-
-    now = datetime.now(timezone.utc).isoformat()
-    bq_rows = [{**row, "updated_at": now} for row in rows]
+    client = _client()
+    tid = _table_id(table_name)
 
     job_config = bigquery.LoadJobConfig(
-        schema=_HR_SERVICE_USAGES_SCHEMA,
-        write_disposition=bigquery.WriteDisposition.WRITE_TRUNCATE,
+        write_disposition=write_disposition,
+        autodetect=True,
     )
-    job = client.load_table_from_json(bq_rows, table_id, job_config=job_config)
+    job = client.load_table_from_dataframe(df, tid, job_config=job_config)
     job.result()
 
-    logger.info(
-        f"BigQuery (hr_service_usages) 更新完了: "
-        f"{current_count}件 → {new_count}件 ({table_id})"
-    )
-    print(f"BigQuery アップロード完了: {new_count}行 → {table_id}")
+    logger.info(f"BigQuery ({table_name}) 完了: {len(df)}行 → {tid}")
+    print(f"BigQuery アップロード完了: {len(df)}行 → {tid}")
 
 
-def upload_contacts(rows: list[dict]) -> None:
+# ---------------------------------------------------------------------------
+# 企業マスター（WRITE_TRUNCATE）
+# ---------------------------------------------------------------------------
+
+
+def upload_company_master(df: pd.DataFrame) -> None:
     """
-    連絡先情報を BigQuery にアップロードする。
-    既存データは全件置換（WRITE_TRUNCATE）。
+    企業マスターを BQ にアップロード。
+    常に最新の全社分で上書き（WRITE_TRUNCATE）。
 
-    Args:
-        rows: [{"企業名": str, "電話番号": str, "ラベル": str, "status": str, "source": str}, ...]
+    期待カラム: original_id, name, name_normalized, stock_code
     """
-    if not rows:
-        logger.warning("BigQuery (contacts): アップロード対象のデータがありません")
-        return
-
-    client = _get_client()
-    table_id = f"{GCP_PROJECT_ID}.{BQ_DATASET}.contacts"
-
-    schema = [
-        bigquery.SchemaField("企業名", "STRING", mode="REQUIRED"),
-        bigquery.SchemaField("company_id", "STRING", mode="NULLABLE"),
-        bigquery.SchemaField("電話番号", "STRING", mode="NULLABLE"),
-        bigquery.SchemaField("ラベル", "STRING", mode="NULLABLE"),
-        bigquery.SchemaField("status", "STRING", mode="NULLABLE"),
-        bigquery.SchemaField("source", "STRING", mode="NULLABLE"),
-        bigquery.SchemaField("updated_at", "TIMESTAMP", mode="REQUIRED"),
-    ]
-
-    table = bigquery.Table(table_id, schema=schema)
-    client.create_table(table, exists_ok=True)
-
-    now = datetime.now(timezone.utc).isoformat()
-    bq_rows = [{**row, "updated_at": now} for row in rows]
-
-    job_config = bigquery.LoadJobConfig(
-        schema=schema,
-        write_disposition=bigquery.WriteDisposition.WRITE_TRUNCATE,
-    )
-    job = client.load_table_from_json(bq_rows, table_id, job_config=job_config)
-    job.result()
-
-    logger.info(f"BigQuery (contacts) アップロード完了: {len(bq_rows)}行")
-    print(f"BigQuery アップロード完了: {len(bq_rows)}行 → {table_id}")
+    _upload(df, "company_master", bigquery.WriteDisposition.WRITE_TRUNCATE)
 
 
-def upload_call_logs(rows: list[dict]) -> None:
+# ---------------------------------------------------------------------------
+# 企業情報DB（WRITE_APPEND）
+# ---------------------------------------------------------------------------
+
+
+def upload_company_info(df: pd.DataFrame) -> None:
     """
-    架電ログデータを BigQuery にアップロードする。
-    既存データは全件追記（WRITE_APPEND）。
+    企業情報DB（中間データ2の突合結果）を BQ に追記。
 
-    Args:
-        rows: CallRow の辞書リスト（csv_importer.CallRow.__dict__ 相当）
+    期待カラム: original_id, 本社所在地, 本社郵便番号, 設立, 代表者, 資本金,
+               従業員数, 業種, 上場区分, 企業URL, 電話番号, 事業所, 関連会社,
+               沿革, 売上高, 純利益, 事業内容, 企業理念, 公開求人数,
+               採用実績校, 採用実績学部学科, みんかぶ財務各項目,
+               エン評判各スコア, HRサービス掲載状況, ...
+               + scraped_at（実行日時）
     """
-    if not rows:
-        logger.warning("BigQuery (call_logs): アップロード対象のデータがありません")
-        return
-
-    client = _get_client()
-    table_id = f"{GCP_PROJECT_ID}.{BQ_DATASET}.call_logs"
-
-    schema = [
-        bigquery.SchemaField("company_name", "STRING", mode="REQUIRED"),
-        bigquery.SchemaField("company_id", "STRING", mode="NULLABLE"),
-        bigquery.SchemaField("sales_rep_name", "STRING", mode="NULLABLE"),
-        bigquery.SchemaField("called_at", "TIMESTAMP", mode="NULLABLE"),
-        bigquery.SchemaField("phone_number", "STRING", mode="NULLABLE"),
-        bigquery.SchemaField("phone_status", "STRING", mode="NULLABLE"),
-        bigquery.SchemaField("product_name", "STRING", mode="NULLABLE"),
-        bigquery.SchemaField("phone_status_memo", "STRING", mode="NULLABLE"),
-        bigquery.SchemaField("discovered_number", "STRING", mode="NULLABLE"),
-        bigquery.SchemaField("discovered_number_memo", "STRING", mode="NULLABLE"),
-        bigquery.SchemaField("call_result", "STRING", mode="NULLABLE"),
-        bigquery.SchemaField("spoke_with", "STRING", mode="NULLABLE"),
-        bigquery.SchemaField("discovered_person_chuto", "STRING", mode="NULLABLE"),
-        bigquery.SchemaField("discovered_person_shinsotsu", "STRING", mode="NULLABLE"),
-        bigquery.SchemaField("notes", "STRING", mode="NULLABLE"),
-        bigquery.SchemaField("updated_at", "TIMESTAMP", mode="REQUIRED"),
-    ]
-
-    table = bigquery.Table(table_id, schema=schema)
-    client.create_table(table, exists_ok=True)
-
-    now = datetime.now(timezone.utc).isoformat()
-    bq_rows = []
-    for row in rows:
-        bq_row = {
-            "company_name": row.get("company_name", ""),
-            "company_id": row.get("company_id"),
-            "sales_rep_name": row.get("sales_rep_name"),
-            "called_at": row["called_at"].isoformat() if row.get("called_at") else None,
-            "phone_number": row.get("phone_number"),
-            "phone_status": row.get("phone_status"),
-            "product_name": row.get("product_name"),
-            "phone_status_memo": row.get("phone_status_memo"),
-            "discovered_number": row.get("discovered_number"),
-            "discovered_number_memo": row.get("discovered_number_memo"),
-            "call_result": row.get("call_result"),
-            "spoke_with": row.get("spoke_with"),
-            "discovered_person_chuto": row.get("discovered_person_chuto"),
-            "discovered_person_shinsotsu": row.get("discovered_person_shinsotsu"),
-            "notes": row.get("notes"),
-            "updated_at": now,
-        }
-        bq_rows.append(bq_row)
-
-    job_config = bigquery.LoadJobConfig(
-        schema=schema,
-        write_disposition=bigquery.WriteDisposition.WRITE_APPEND,
-    )
-    job = client.load_table_from_json(bq_rows, table_id, job_config=job_config)
-    job.result()
-
-    logger.info(f"BigQuery (call_logs) アップロード完了: {len(bq_rows)}行")
-    print(f"BigQuery アップロード完了: {len(bq_rows)}行 → {table_id}")
+    _upload(df, "company_info", bigquery.WriteDisposition.WRITE_APPEND)
 
 
-_EN_HYOUBAN_SCHEMA = [
-    bigquery.SchemaField("企業名", "STRING", mode="REQUIRED"),
-    bigquery.SchemaField("company_id", "STRING", mode="NULLABLE"),
-    bigquery.SchemaField("エン評判_総合スコア", "STRING", mode="NULLABLE"),
-    bigquery.SchemaField("エン評判_口コミ件数", "STRING", mode="NULLABLE"),
-    bigquery.SchemaField("エン評判_成長性", "STRING", mode="NULLABLE"),
-    bigquery.SchemaField("エン評判_優位性", "STRING", mode="NULLABLE"),
-    bigquery.SchemaField("エン評判_実力主義", "STRING", mode="NULLABLE"),
-    bigquery.SchemaField("エン評判_風土", "STRING", mode="NULLABLE"),
-    bigquery.SchemaField("エン評判_20代成長環境", "STRING", mode="NULLABLE"),
-    bigquery.SchemaField("エン評判_社会貢献", "STRING", mode="NULLABLE"),
-    bigquery.SchemaField("エン評判_イノベーション", "STRING", mode="NULLABLE"),
-    bigquery.SchemaField("エン評判_経営陣", "STRING", mode="NULLABLE"),
-    bigquery.SchemaField("エン評判_口コミ本文", "STRING", mode="NULLABLE"),
-    bigquery.SchemaField("updated_at", "TIMESTAMP", mode="REQUIRED"),
-]
+# ---------------------------------------------------------------------------
+# 連絡先（WRITE_APPEND）
+# ---------------------------------------------------------------------------
 
 
-def upload_en_hyouban_reviews(rows: list[dict]) -> None:
+def upload_phones(df: pd.DataFrame) -> None:
     """
-    エン カイシャの評判データを BigQuery にアップロードする。
-    既存データは全件置換（WRITE_TRUNCATE）。
+    電話番号DB を BQ に追記。
 
-    Args:
-        rows: [{"企業名": str, "company_id": str|None,
-                "エン評判_総合スコア": str, "エン評判_口コミ件数": str,
-                "エン評判_成長性": str, ...}, ...]
+    期待カラム: original_id, source_url, 拠点, 事業部, ラベル, 電話番号,
+               担当者名リレーションキー, scraped_at
     """
-    if not rows:
-        logger.warning("BigQuery (en_hyouban_reviews): アップロード対象のデータがありません")
-        return
+    _upload(df, "phones", bigquery.WriteDisposition.WRITE_APPEND)
 
-    client = _get_client()
-    table_id = f"{GCP_PROJECT_ID}.{BQ_DATASET}.en_hyouban_reviews"
 
-    table = bigquery.Table(table_id, schema=_EN_HYOUBAN_SCHEMA)
-    client.create_table(table, exists_ok=True)
+def upload_persons(df: pd.DataFrame) -> None:
+    """
+    担当者DB を BQ に追記。
 
-    now = datetime.now(timezone.utc).isoformat()
-    bq_rows = [{**row, "updated_at": now} for row in rows]
+    期待カラム: original_id, source_url, 拠点, 事業部, ラベル, 担当者名,
+               電話番号リレーションキー, scraped_at
+    """
+    _upload(df, "persons", bigquery.WriteDisposition.WRITE_APPEND)
 
-    job_config = bigquery.LoadJobConfig(
-        schema=_EN_HYOUBAN_SCHEMA,
-        write_disposition=bigquery.WriteDisposition.WRITE_TRUNCATE,
-    )
-    job = client.load_table_from_json(bq_rows, table_id, job_config=job_config)
-    job.result()
 
-    logger.info(f"BigQuery (en_hyouban_reviews) アップロード完了: {len(bq_rows)}行")
-    print(f"BigQuery アップロード完了: {len(bq_rows)}行 → {table_id}")
+def upload_emails(df: pd.DataFrame) -> None:
+    """
+    メールアドレスDB を BQ に追記。
+
+    期待カラム: original_id, 事業部, メールアドレス, scraped_at
+    """
+    _upload(df, "emails", bigquery.WriteDisposition.WRITE_APPEND)
+
+
+def upload_phone_person_relation(df: pd.DataFrame) -> None:
+    """
+    連絡先×担当者リレーションDB を BQ に追記。
+
+    期待カラム: phone_id, person_id, source, confirmed_at, call_log_id
+    """
+    _upload(df, "phone_person_relation", bigquery.WriteDisposition.WRITE_APPEND)
+
+
+# ---------------------------------------------------------------------------
+# 競合・類似企業（WRITE_APPEND）
+# ---------------------------------------------------------------------------
+
+
+def upload_competitors(df: pd.DataFrame) -> None:
+    """
+    競合・類似企業DB を BQ に追記。
+
+    期待カラム: original_id, 類似企業1〜3, 競合企業1〜3, scraped_at
+    """
+    _upload(df, "competitors", bigquery.WriteDisposition.WRITE_APPEND)
+
+
+# ---------------------------------------------------------------------------
+# HRサービス（WRITE_APPEND）
+# ---------------------------------------------------------------------------
+
+
+def upload_hr_services(df: pd.DataFrame) -> None:
+    """
+    競合HRサービスDB（14サービス縦持ち）を BQ に追記。
+
+    期待カラム: original_id, service_name, 企業名_掲載名, 掲載日, scraped_at
+    """
+    _upload(df, "hr_services", bigquery.WriteDisposition.WRITE_APPEND)
+
+
+# ---------------------------------------------------------------------------
+# 架電ログ（WRITE_APPEND）
+# ---------------------------------------------------------------------------
+
+
+def upload_call_logs(df: pd.DataFrame) -> None:
+    """
+    架電ログDB を BQ に追記。
+
+    期待カラム: original_id, company_name, sales_rep_name, called_at,
+               phone_number, phone_status, product_name, phone_status_memo,
+               discovered_number, discovered_number_memo, call_result,
+               spoke_with, discovered_person_chuto, discovered_person_shinsotsu,
+               notes
+    """
+    _upload(df, "call_logs", bigquery.WriteDisposition.WRITE_APPEND)
+
+
+# ---------------------------------------------------------------------------
+# ログ情報（WRITE_APPEND）
+# ---------------------------------------------------------------------------
+
+
+def upload_logs(df: pd.DataFrame) -> None:
+    """
+    実行ログ・充填率・エラー・API使用量等を BQ に追記。
+
+    期待カラム: run_id, run_at, table_name, field_name, filled_count,
+               total_count, fill_rate, error_type, api_calls, ... 等
+    """
+    _upload(df, "logs", bigquery.WriteDisposition.WRITE_APPEND)

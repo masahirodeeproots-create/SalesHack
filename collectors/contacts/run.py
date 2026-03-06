@@ -28,9 +28,7 @@ collectors/contacts/run.py
 import argparse
 import json
 import logging
-import os
 import sys
-import threading
 import time
 from concurrent.futures import ThreadPoolExecutor
 from pathlib import Path
@@ -43,7 +41,7 @@ if _PROJECT_ROOT not in sys.path:
 
 from config.settings import CHECKPOINT_DIR, LOG_DIR
 from db.connection import get_session
-from db.models import Company, PhoneNumber
+from db.models import Company
 from collectors.contacts.page_fetcher import fetch_google_snippets
 from collectors.contacts.regex_extractor import extract_phones, extract_emails, has_contact_signals
 from collectors.contacts.gemini_analyzer import (
@@ -70,6 +68,57 @@ logger = logging.getLogger(__name__)
 CHECKPOINT_FILE = CHECKPOINT_DIR / "contacts_checkpoint.json"
 GEMINI_INTERVAL = 1.5  # Gemini APIの呼び出し間隔（秒）
 BATCH_SIZE = 3          # 1回のGemini呼び出しで処理するスニペット数
+
+# ---------------------------------------------------------------------------
+# API使用量トラッカー
+# ---------------------------------------------------------------------------
+
+class _Stats:
+    def __init__(self):
+        self.sd_google: int = 0
+        self.gemini_calls: int = 0
+        self.gemini_in_tokens: int = 0
+        self.gemini_out_tokens: int = 0
+
+    @property
+    def gemini_total_tokens(self) -> int:
+        return self.gemini_in_tokens + self.gemini_out_tokens
+
+
+STATS = _Stats()
+
+
+def _apply_patches():
+    """ScrapingDog・Gemini APIの呼び出し回数・トークン数を計測するパッチを適用する"""
+    import requests as _req
+    _orig = _req.Session.request
+
+    def _patched(self, method, url, **kwargs):
+        if "scrapingdog.com/google" in str(url):
+            STATS.sd_google += 1
+        return _orig(self, method, url, **kwargs)
+
+    _req.Session.request = _patched
+
+    try:
+        import google.generativeai as genai
+        _orig_gen = genai.GenerativeModel.generate_content
+
+        def _patched_gen(self, *args, **kwargs):
+            resp = _orig_gen(self, *args, **kwargs)
+            try:
+                um = resp.usage_metadata
+                STATS.gemini_in_tokens += um.prompt_token_count or 0
+                STATS.gemini_out_tokens += um.candidates_token_count or 0
+            except Exception:
+                pass
+            STATS.gemini_calls += 1
+            return resp
+
+        genai.GenerativeModel.generate_content = _patched_gen
+        logger.info("API計測パッチ適用（ScrapingDog + Gemini）")
+    except ImportError:
+        pass
 
 # GeminiキープールはモジュールロードI時に初期化（キーが1つでも動作）
 def _build_key_pool() -> GeminiKeyPool:
@@ -227,6 +276,8 @@ def main() -> None:
     parser.add_argument("--dry-run", action="store_true", help="DBに書き込まずログ出力のみ")
     args = parser.parse_args()
 
+    _apply_patches()
+
     if args.reset_checkpoint:
         CHECKPOINT_FILE.unlink(missing_ok=True)
         logger.info("チェックポイントをリセットしました")
@@ -264,36 +315,15 @@ def main() -> None:
             logger.error(f"エラー ({name}): {e}", exc_info=True)
 
     logger.info(f"完了: {success_count}/{len(targets)} 社")
+    logger.info("─" * 50)
+    logger.info("【API使用量】")
+    logger.info(f"  ScrapingDog Google検索: {STATS.sd_google}回")
+    logger.info(f"  Gemini 呼び出し回数:    {STATS.gemini_calls}回")
+    logger.info(f"  Gemini 入力トークン:    {STATS.gemini_in_tokens:,}")
+    logger.info(f"  Gemini 出力トークン:    {STATS.gemini_out_tokens:,}")
+    logger.info(f"  Gemini 合計トークン:    {STATS.gemini_total_tokens:,}")
+    logger.info("─" * 50)
 
-    # BigQuery アップロード（UPLOAD_TO_BIGQUERY=true の場合）
-    if os.getenv("UPLOAD_TO_BIGQUERY", "").lower() == "true":
-        try:
-            from db.bigquery import upload_contacts
-            with get_session() as session:
-                phone_rows = session.query(
-                    PhoneNumber.company_id,
-                    PhoneNumber.number,
-                    PhoneNumber.label,
-                    PhoneNumber.status,
-                    PhoneNumber.source,
-                ).all()
-            # 企業名を company_id から解決
-            with get_session() as session:
-                companies = {str(c.id): c.name_normalized for c in session.query(Company).all()}
-            bq_rows = [
-                {
-                    "企業名": companies.get(str(row.company_id), ""),
-                    "company_id": str(row.company_id),
-                    "電話番号": row.number,
-                    "ラベル": row.label or "",
-                    "status": row.status or "",
-                    "source": row.source or "",
-                }
-                for row in phone_rows
-            ]
-            upload_contacts(bq_rows)
-        except Exception as e:
-            logger.error(f"BigQuery アップロード失敗: {e}")
 
 
 if __name__ == "__main__":

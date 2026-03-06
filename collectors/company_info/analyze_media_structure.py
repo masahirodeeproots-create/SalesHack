@@ -385,7 +385,7 @@ def build_prompt(media_name: str, company_texts: dict) -> str:
 
 def call_gemini(prompt: str) -> dict:
     """Gemini APIにプロンプトを送り、JSON形式のレスポンスを返す"""
-    model = genai.GenerativeModel("gemini-2.5-flash")
+    model = genai.GenerativeModel("gemini-2.5-flash-lite")
     response = model.generate_content(
         prompt,
         generation_config=genai.GenerationConfig(response_mime_type="application/json"),

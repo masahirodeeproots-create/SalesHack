@@ -1,25 +1,29 @@
 """サービス定義・共通定数・パス設定"""
 
 import sys
+import importlib.util
 from pathlib import Path
 
-# プロジェクトルートを sys.path に追加（config.settings を解決するため）
+# プロジェクトルートを sys.path に追加
 _PROJECT_ROOT = str(Path(__file__).resolve().parent.parent.parent)
 if _PROJECT_ROOT not in sys.path:
     sys.path.insert(0, _PROJECT_ROOT)
 
-# 共通設定はプロジェクト全体の settings から再エクスポート
-from config.settings import (  # noqa: E402, F401
-    HR_OUTPUT_DIR as OUTPUT_DIR,
-    LOG_DIR,
-    REQUEST_INTERVAL,
-    MAX_RETRIES,
-    RETRY_BACKOFF_BASE,
-    USER_AGENT,
-    CSV_ENCODING,
-    SCRAPINGDOG_SCRAPE_ENDPOINT,
-    HR_SERVICES_CSV_COLUMNS as CSV_COLUMNS,
-)
+# 共通設定をファイルパスで直接ロード（ローカル config.py との名前衝突を回避）
+_settings_path = Path(__file__).resolve().parent.parent.parent / "config" / "settings.py"
+_spec = importlib.util.spec_from_file_location("_project_settings", _settings_path)
+_settings = importlib.util.module_from_spec(_spec)
+_spec.loader.exec_module(_settings)
+
+OUTPUT_DIR = _settings.HR_OUTPUT_DIR
+LOG_DIR = _settings.LOG_DIR
+REQUEST_INTERVAL = _settings.REQUEST_INTERVAL
+MAX_RETRIES = _settings.MAX_RETRIES
+RETRY_BACKOFF_BASE = _settings.RETRY_BACKOFF_BASE
+USER_AGENT = _settings.USER_AGENT
+CSV_ENCODING = _settings.CSV_ENCODING
+SCRAPINGDOG_SCRAPE_ENDPOINT = _settings.SCRAPINGDOG_SCRAPE_ENDPOINT
+CSV_COLUMNS = _settings.HR_SERVICES_CSV_COLUMNS
 
 # ---------------------------------------------------------------------------
 # HR Services 固有定数
@@ -84,13 +88,6 @@ SERVICE_REGISTRY = {
         "method": "requests",
         "output_csv": "en_tenshoku.csv",
     },
-    "kimisuka": {
-        "name": "キミスカ",
-        "category": "新卒",
-        "base_url": "https://kimisuka.com/company/case",
-        "method": "requests",
-        "output_csv": "kimisuka.csv",
-    },
     "caritasu": {
         "name": "キャリタス",
         "category": "新卒",
@@ -119,6 +116,24 @@ SERVICE_REGISTRY = {
         "base_url": "https://en-ambi.com/search/?jobmerit=350&krt=top",
         "method": "requests",
         "output_csv": "en_ambi.csv",
+    },
+    "hitotore": {
+        "name": "ヒトトレ",
+        "category": "中途",
+        "method": "csv_upload",
+        "output_csv": "hitotore.csv",
+    },
+    "acaric": {
+        "name": "アカリク",
+        "category": "新卒",
+        "method": "csv_upload",
+        "output_csv": "acaric.csv",
+    },
+    "supporters": {
+        "name": "サポーターズ",
+        "category": "新卒",
+        "method": "csv_upload",
+        "output_csv": "supporters.csv",
     },
     "type_chuto": {
         "name": "type中途",

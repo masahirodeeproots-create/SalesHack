@@ -1,12 +1,11 @@
-"""ビズリーチ スクレイパー - https://www.bizreach.jp/job/
-Playwright によるログイン認証 + 大量求人ページネーション。
-182,427件 → 新規企業発見率が低下したら自動停止。
+"""ビズリーチ スクレイパー - https://www.bizreach.jp/jobs/search/
+Playwright によるOAuthログイン(auth.id.bizreach.jp) + 求人ページネーション。
+100,000件以上 → 新規企業発見率が低下したら自動停止。
 チェックポイントで中断再開対応。
 """
 
 import os
 import asyncio
-import re
 from dotenv import load_dotenv
 
 from scrapers.base import BaseScraper
@@ -19,8 +18,9 @@ class Scraper(BaseScraper):
     output_filename = "bizreach.csv"         # 企業単位 dedup 済み
     output_filename_raw = "bizreach_raw.csv"  # 求人単位 raw
 
+    # OAuth経由でログインするため、/login/ がauth.id.bizreach.jpにリダイレクトされる
     LOGIN_URL = "https://www.bizreach.jp/login/"
-    JOB_SEARCH_URL = "https://www.bizreach.jp/job/"
+    JOB_SEARCH_URL = "https://www.bizreach.jp/jobs/search/"
 
     # 新規企業発見率がこの閾値未満になったら停止
     NEW_COMPANY_RATE_THRESHOLD = 0.05
@@ -64,45 +64,36 @@ class Scraper(BaseScraper):
             page = await context.new_page()
 
             try:
-                # ログイン
+                # ログイン（auth.id.bizreach.jp にリダイレクトされる）
                 self.logger.info("ログインページへ遷移中...")
-                await page.goto(self.LOGIN_URL, wait_until="networkidle")
-                await page.wait_for_timeout(2000)
-
-                # メールアドレス入力
-                email_input = page.locator('input[type="email"], input[name="email"], input[name="username"]')
-                if await email_input.count() > 0:
-                    await email_input.first.fill(email)
-
-                # パスワード入力
-                password_input = page.locator('input[type="password"]')
-                if await password_input.count() > 0:
-                    await password_input.first.fill(password)
-
-                # ログインボタン
-                submit_btn = page.locator('button[type="submit"], input[type="submit"]')
-                if await submit_btn.count() > 0:
-                    await submit_btn.first.click()
-                else:
-                    login_btn = page.locator('button:has-text("ログイン")')
-                    if await login_btn.count() > 0:
-                        await login_btn.first.click()
-
-                await page.wait_for_load_state("networkidle")
+                await page.goto(self.LOGIN_URL, wait_until="domcontentloaded", timeout=30000)
                 await page.wait_for_timeout(3000)
-                self.logger.info("ログイン完了")
 
-                # 求人検索ページネーション
+                # OAuth ログインフォーム（auth.id.bizreach.jp）
+                # ソーシャルログインボタン群の後に email/password フォーム
+                await page.locator('input[type="email"]').first.fill(email)
+                await page.locator('input[type="password"]').first.fill(password)
+
+                # 最後のボタンが「ログイン」（ソーシャルログインボタンの後）
+                buttons = page.locator("button")
+                btn_count = await buttons.count()
+                await buttons.nth(btn_count - 1).click()
+
+                await page.wait_for_load_state("domcontentloaded")
+                await page.wait_for_timeout(5000)
+                self.logger.info(f"ログイン完了: {page.url}")
+
+                # 求人検索ページネーション（フィルターなし・更新日順）
                 page_num = max(start_page, 1)
                 recent_new_count = 0
                 recent_total_count = 0
 
                 while True:
-                    url = f"{self.JOB_SEARCH_URL}?p={page_num}&pageSize=20"
+                    url = f"{self.JOB_SEARCH_URL}?pageNumber={page_num}&sort=UPDATED_DESC"
                     self.logger.info(f"Page {page_num}: {url}")
 
-                    await page.goto(url, wait_until="networkidle")
-                    await page.wait_for_timeout(2000)
+                    await page.goto(url, wait_until="domcontentloaded", timeout=30000)
+                    await page.wait_for_timeout(5000)
 
                     html = await page.content()
                     items = self._parse_page(html)
@@ -161,47 +152,39 @@ class Scraper(BaseScraper):
         self.clear_checkpoint()
 
     def _parse_page(self, html: str) -> list[dict]:
-        """HTML解析で企業名と求人タイトルを抽出"""
+        """HTML解析で企業名と求人タイトルを抽出
+        カード構造:
+          li[class*="JobListItem"]
+            h3[class*="JobTitle"] → 求人タイトル
+            [class*="grow-1"] p[class*="bold"] → 企業名
+        """
         from bs4 import BeautifulSoup
 
         soup = BeautifulSoup(html, "lxml")
         items = []
 
-        # 求人カード: h2/h3見出しとリンク
-        job_cards = soup.find_all("a", href=re.compile(r"/job/\d+"))
-        seen_urls = set()
+        cards = soup.select('li[class*="JobListItem"]')
 
-        for link in job_cards:
-            href = link.get("href", "")
-            if href in seen_urls:
-                continue
-            seen_urls.add(href)
+        for card in cards:
+            # 求人タイトル
+            title_el = card.select_one('h3[class*="JobTitle"]')
+            title = title_el.get_text(strip=True) if title_el else ""
 
-            # カード内からデータ抽出
-            card = link.find_parent("li") or link.find_parent("div") or link
+            # 企業名: grow-1 div 内の bold p 要素
             company_name = ""
-            title = ""
+            grow_div = card.select_one('[class*="grow-1"]')
+            if grow_div:
+                bold_p = grow_div.select_one('p[class*="bold"]')
+                if bold_p:
+                    company_name = bold_p.get_text(strip=True)
 
-            # 見出し要素からタイトル
-            heading = card.find(["h2", "h3"])
-            if heading:
-                title = heading.get_text(strip=True)
-
-            # 企業名を探す（ログイン後に表示される）
-            text_lines = card.get_text(separator="\n", strip=True).split("\n")
-            text_lines = [l.strip() for l in text_lines if l.strip()]
-
-            for line in text_lines:
-                if line == title:
-                    continue
-                # 給与・勤務地パターンをスキップ
-                if re.match(r"^\d+万円", line) or "万円〜" in line or "万円～" in line:
-                    continue
-                if line in ("NEW", "注目", "急募", "おすすめ"):
-                    continue
-                if len(line) >= 2 and len(line) <= 50:
-                    company_name = line
-                    break
+            if not company_name:
+                # フォールバック: カード内の bold p で「気になる」「万円」以外
+                for bp in card.select('p[class*="bold"]'):
+                    text = bp.get_text(strip=True)
+                    if text and text not in ("気になる", "") and "万円" not in text:
+                        company_name = text
+                        break
 
             if company_name:
                 items.append({

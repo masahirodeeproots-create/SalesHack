@@ -196,7 +196,7 @@ def analyze_snippet(
     snippet: Snippet,
     phones: list[PhoneCandidate],
     emails: list[EmailCandidate],
-    model_name: str = "gemini-2.0-flash",
+    model_name: str = "gemini-2.5-flash-lite",
     retry: int = 2,
 ) -> dict:
     """
@@ -240,7 +240,7 @@ def analyze_snippets_batch(
     phones_list: list[list[PhoneCandidate]],
     emails_list: list[list[EmailCandidate]],
     api_key: Optional[str] = None,
-    model_name: str = "gemini-2.0-flash",
+    model_name: str = "gemini-2.5-flash-lite",
     retry: int = 2,
 ) -> dict:
     """

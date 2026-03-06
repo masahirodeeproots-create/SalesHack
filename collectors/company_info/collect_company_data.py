@@ -275,80 +275,67 @@ def extract_kyujin_count(html: str) -> str | None:
 
 
 def extract_kyujin_urls(html: str) -> list[str]:
-    """リクルートエージェント企業ページから求人URLを抽出"""
+    """リクルートエージェント企業ページから求人URLを抽出。
+    旧形式 /kensaku/kyujin/ と新形式 /viewjob/ の両方に対応。"""
     soup = BeautifulSoup(html, "html.parser")
     base_url = "https://www.r-agent.com"
     urls = []
     seen = set()
     for a_tag in soup.find_all("a", href=True):
         href = a_tag["href"]
-        if "/kensaku/kyujin/" in href and href.endswith(".html"):
+        is_old = "/kensaku/kyujin/" in href and href.endswith(".html")
+        is_new = "/viewjob/" in href
+        if is_old or is_new:
             if href.startswith("/"):
                 full_url = base_url + href
             elif href.startswith("http"):
                 full_url = href
             else:
                 continue
-            if full_url not in seen:
-                seen.add(full_url)
+            # クエリパラメータを除去して重複チェック
+            clean = full_url.split("?")[0].rstrip("/")
+            if clean not in seen:
+                seen.add(clean)
                 urls.append(full_url)
     return urls
 
 
 def extract_similar_search_fields(html: str) -> dict[str, str]:
-    """リクルートエージェント求人ページの「この求人に似た求人を探す」セクションを解析"""
+    """リクルートエージェント求人ページ（/viewjob/）から求人情報を抽出。
+
+    新サイト構造対応:
+    - 想定年収: 給与セル内のテキストから正規表現で抽出
+    - 仕事の特徴: span タグのタグリスト（カンマ区切り）
+    """
+    import re
     soup = BeautifulSoup(html, "html.parser")
-
-    target_h2 = None
-    for h2 in soup.find_all("h2"):
-        if "この求人に似た求人を探す" in h2.get_text():
-            target_h2 = h2
-            break
-    if target_h2 is None:
-        return {}
-
-    table = None
-    for sibling in target_h2.find_next_siblings():
-        if sibling.name == "table":
-            table = sibling
-            break
-        found = sibling.find("table")
-        if found:
-            table = found
-            break
-    if table is None:
-        return {}
-
-    raw_fields = {}
-    for row in table.find_all("tr"):
-        th = row.find("th")
-        td = row.find("td")
-        if th and td:
-            label = th.get_text(strip=True)
-            raw_fields[label] = td
-
     result = {}
-    if "業界" in raw_fields:
-        td_el = raw_fields["業界"]
-        a_tags = td_el.find_all("a")
-        hierarchy = [a.get_text(strip=True) for a in a_tags]
-        for i in range(5):
-            result[f"業界_階層{i + 1}"] = hierarchy[i] if i < len(hierarchy) else ""
-    else:
-        for i in range(5):
-            result[f"業界_階層{i + 1}"] = ""
 
-    field_mapping = {
-        "職種": "職種_求人",
-        "勤務地": "勤務地_求人",
-        "スキル": "スキル",
-        "こだわり": "こだわり",
-    }
-    for raw_label, canonical_key in field_mapping.items():
-        if raw_label in raw_fields:
-            result[canonical_key] = raw_fields[raw_label].get_text(strip=True)
-        else:
-            result[canonical_key] = ""
+    # h3 ラベルの行を持つテーブル（table[0]）を探す
+    for table in soup.find_all("table"):
+        for row in table.find_all("tr"):
+            h3 = row.find("h3")
+            if not h3:
+                continue
+            label = h3.get_text(strip=True)
+            tds = row.find_all("td")
+            content_td = tds[1] if len(tds) > 1 else (tds[0] if tds else None)
+            if not content_td:
+                continue
+
+            # 給与 → 想定年収を抽出
+            if label == "給与":
+                text = content_td.get_text()
+                m = re.search(r"想定年収\s*\n?\s*([\d,]+万円[～〜\-－][\d,]+万円)", text)
+                if m:
+                    result["想定年収"] = m.group(1)
+
+            # 仕事の特徴 → span タグをカンマ区切り
+            if label == "仕事の特徴":
+                spans = content_td.find_all("span")
+                tags = [s.get_text(strip=True) for s in spans if s.get_text(strip=True)]
+                if tags:
+                    result["仕事の特徴"] = ", ".join(tags)
 
     return result
 
@@ -521,7 +508,7 @@ def main():
     if GEMINI_API_KEY:
         import google.generativeai as genai
         genai.configure(api_key=GEMINI_API_KEY)
-        gemini_model = genai.GenerativeModel("gemini-2.5-flash")
+        gemini_model = genai.GenerativeModel("gemini-2.5-flash-lite")
         print("Gemini API: 有効（未解決フィールドのフォールバック用）")
     else:
         print("Gemini API: 無効（ルールベースのみ）")

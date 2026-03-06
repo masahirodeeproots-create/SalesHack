@@ -59,14 +59,16 @@ class Scraper(BaseScraper):
             title = title_el.get_text(strip=True) if title_el else ""
 
             # 掲載日: div.term span.data
+            # "26/03/06～26/03/19" → "2026-03-06～2026-03-19"
             date_el = unit.select_one("div.term span.data")
             posting_date = ""
             if date_el:
                 date_text = date_el.get_text(strip=True)
-                # "26/03/01～26/03/15" → "2026-03-01"
-                date_match = re.match(r"(\d{2})/(\d{2})/(\d{2})", date_text)
-                if date_match:
-                    posting_date = f"20{date_match.group(1)}-{date_match.group(2)}-{date_match.group(3)}"
+                dates = re.findall(r"(\d{2})/(\d{2})/(\d{2})", date_text)
+                if dates:
+                    # 終了日のみ取得（最後の日付）
+                    y, m, d = dates[-1]
+                    posting_date = f"20{y}-{m}-{d}"
 
             if company_name:
                 items.append({

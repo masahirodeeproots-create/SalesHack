@@ -62,6 +62,8 @@ class Scraper(BaseScraper):
 
     def _extract_slugs(self, sitemap_xml: str) -> list[str]:
         """サイトマップXMLから企業スラグを抽出"""
+        from urllib.parse import quote
+
         soup = BeautifulSoup(sitemap_xml, "lxml-xml")
         slugs = set()
 
@@ -72,14 +74,15 @@ class Scraper(BaseScraper):
             if m:
                 slug = m.group(1)
                 if slug not in self.NAV_SLUGS and not slug.startswith("_"):
-                    slugs.add(slug)
+                    # スペース等を含むスラグをURLエンコード
+                    slugs.add(quote(slug, safe=""))
 
             # サブページURL: https://www.talent-book.jp/{slug}/stories/xxx
             m = re.match(r"https://www\.talent-book\.jp/([^/]+)/", url)
             if m:
                 slug = m.group(1)
                 if slug not in self.NAV_SLUGS and not slug.startswith("_"):
-                    slugs.add(slug)
+                    slugs.add(quote(slug, safe=""))
 
         return sorted(slugs)
 

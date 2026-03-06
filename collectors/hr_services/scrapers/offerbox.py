@@ -1,10 +1,11 @@
 """オファーボックス スクレイパー - https://app.offerbox.jp/v2/scompany
 Playwright によるログイン認証 + 企業一覧スクレイピング。
+ログインフォーム: input[name="LOGINID"] / input[name="PASSWORD"]
+企業名セレクタ: ul.company-list > li.check > p.link-list__tit
 """
 
 import os
 import asyncio
-import re
 from dotenv import load_dotenv
 
 from scrapers.base import BaseScraper
@@ -47,49 +48,31 @@ class Scraper(BaseScraper):
             try:
                 # ログイン
                 self.logger.info("ログインページへ遷移中...")
-                await page.goto(self.LOGIN_URL, wait_until="networkidle")
-                await page.wait_for_timeout(2000)
-
-                # メールアドレス入力
-                email_input = page.locator('input[type="email"], input[name="email"], input[name="username"]')
-                if await email_input.count() > 0:
-                    await email_input.first.fill(email)
-                else:
-                    # 代替セレクタ
-                    inputs = page.locator("input")
-                    count = await inputs.count()
-                    for i in range(count):
-                        input_type = await inputs.nth(i).get_attribute("type")
-                        if input_type in ("email", "text"):
-                            await inputs.nth(i).fill(email)
-                            break
-
-                # パスワード入力
-                password_input = page.locator('input[type="password"]')
-                if await password_input.count() > 0:
-                    await password_input.first.fill(password)
-
-                # ログインボタンクリック
-                submit_btn = page.locator('button[type="submit"], input[type="submit"]')
-                if await submit_btn.count() > 0:
-                    await submit_btn.first.click()
-                else:
-                    # 代替: ログインテキストを含むボタン
-                    login_btn = page.locator('button:has-text("ログイン")')
-                    if await login_btn.count() > 0:
-                        await login_btn.first.click()
-
-                await page.wait_for_load_state("networkidle")
+                await page.goto(self.LOGIN_URL, wait_until="domcontentloaded")
                 await page.wait_for_timeout(3000)
-                self.logger.info("ログイン完了")
+
+                # OfferBox 固有のフォーム: LOGINID / PASSWORD
+                await page.locator('input[name="LOGINID"]').fill(email)
+                await page.locator('input[name="PASSWORD"]').fill(password)
+
+                # ログインボタン（「Googleでログイン」ではなく最後の「ログイン」ボタン）
+                buttons = page.locator('button:has-text("ログイン")')
+                btn_count = await buttons.count()
+                await buttons.nth(btn_count - 1).click()
+
+                await page.wait_for_load_state("domcontentloaded")
+                await page.wait_for_timeout(5000)
+                self.logger.info(f"ログイン完了: {page.url}")
 
                 # 企業一覧ページへ遷移
                 self.logger.info("企業一覧ページへ遷移中...")
-                await page.goto(self.COMPANY_LIST_URL, wait_until="networkidle")
-                await page.wait_for_timeout(3000)
+                await page.goto(self.COMPANY_LIST_URL, wait_until="domcontentloaded")
+                await page.wait_for_timeout(5000)
 
                 # ページネーションしながら企業名を取得
                 page_num = 1
+                seen_companies: set[str] = set()
+
                 while True:
                     self.logger.info(f"Page {page_num}: 企業データ取得中...")
 
@@ -100,9 +83,16 @@ class Scraper(BaseScraper):
                         self.logger.info(f"Page {page_num}: 結果なし → 終了")
                         break
 
-                    self.results.extend(companies)
+                    # 重複排除しながら追加
+                    new_count = 0
+                    for c in companies:
+                        if c["企業名"] not in seen_companies:
+                            seen_companies.add(c["企業名"])
+                            self.results.append(c)
+                            new_count += 1
+
                     self.logger.info(
-                        f"Page {page_num}: {len(companies)}社取得（累計: {len(self.results)}社）"
+                        f"Page {page_num}: {len(companies)}社（新規{new_count}社、累計: {len(self.results)}社）"
                     )
 
                     # 次のページへ
@@ -112,8 +102,8 @@ class Scraper(BaseScraper):
                     )
                     if await next_btn.count() > 0:
                         await next_btn.first.click()
-                        await page.wait_for_load_state("networkidle")
-                        await page.wait_for_timeout(2000)
+                        await page.wait_for_load_state("domcontentloaded")
+                        await page.wait_for_timeout(3000)
                         page_num += 1
                     else:
                         self.logger.info("次へボタンなし → 終了")
@@ -121,6 +111,8 @@ class Scraper(BaseScraper):
 
             except Exception as e:
                 self.logger.error(f"Playwright エラー: {e}", exc_info=True)
+                if self.results:
+                    self.save_csv()
             finally:
                 await browser.close()
 
@@ -130,25 +122,17 @@ class Scraper(BaseScraper):
 
         soup = BeautifulSoup(html, "lxml")
         companies = []
-        seen = set()
 
-        # 企業カードのリンクや見出しから企業名を抽出
-        # パターン1: company関連リンク
-        company_els = soup.select(
-            "a[href*='company'], [class*='company'] h2, "
-            "[class*='company'] h3, [class*='company'] a"
-        )
-
-        for el in company_els:
+        # OfferBox の企業名セレクタ: p.link-list__tit
+        name_els = soup.select("p.link-list__tit")
+        for el in name_els:
             name = el.get_text(strip=True)
-            if name and len(name) >= 2 and name not in seen:
-                if name not in ("企業一覧", "企業検索", "もっと見る"):
-                    seen.add(name)
-                    companies.append({
-                        "企業名": name,
-                        "タイトル": "",
-                        "掲載日": "",
-                    })
+            if name and len(name) >= 2:
+                companies.append({
+                    "企業名": name,
+                    "タイトル": "",
+                    "掲載日": "",
+                })
 
         return companies
 
